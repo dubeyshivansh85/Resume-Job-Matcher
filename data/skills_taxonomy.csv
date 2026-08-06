@@ -1,0 +1,142 @@
+skill_name,category,synonyms
+python,technical,
+sql,technical,structured query language
+r,technical,
+java,technical,
+scala,technical,
+c++,technical,cpp
+javascript,technical,js
+excel,tool,microsoft excel
+tableau,tool,
+power bi,tool,powerbi
+looker,tool,
+machine learning,technical,ml
+deep learning,technical,dl
+natural language processing,technical,nlp
+computer vision,technical,cv
+data visualization,technical,
+data analysis,technical,
+data engineering,technical,
+data modeling,technical,
+statistics,technical,statistical analysis
+a/b testing,technical,ab testing
+hypothesis testing,technical,
+regression,technical,
+classification,technical,
+clustering,technical,
+neural networks,technical,
+tensorflow,tool,
+pytorch,tool,
+keras,tool,
+scikit-learn,tool,sklearn
+pandas,tool,
+numpy,tool,
+matplotlib,tool,
+seaborn,tool,
+spark,tool,apache spark
+hadoop,tool,
+kafka,tool,apache kafka
+airflow,tool,apache airflow
+etl,technical,extract transform load
+dbt,tool,
+snowflake,tool,
+redshift,tool,amazon redshift
+bigquery,tool,google bigquery
+aws,tool,amazon web services
+azure,tool,microsoft azure
+gcp,tool,google cloud platform
+docker,tool,
+kubernetes,tool,k8s
+git,tool,
+github,tool,
+ci/cd,technical,continuous integration
+linux,technical,
+bash,technical,shell scripting
+rest api,technical,restful api
+graphql,technical,
+mongodb,tool,
+postgresql,tool,postgres
+mysql,tool,
+nosql,technical,
+data warehousing,technical,
+big data,technical,
+distributed systems,technical,
+time series analysis,technical,
+recommendation systems,technical,
+llm,technical,large language models
+generative ai,technical,genai
+prompt engineering,technical,
+huggingface,tool,hugging face
+langchain,tool,
+mlops,technical,
+model deployment,technical,
+feature engineering,technical,
+data cleaning,technical,data wrangling
+data pipeline,technical,
+spreadsheet modeling,technical,
+financial modeling,technical,
+business intelligence,technical,bi
+kpi tracking,technical,
+dashboarding,technical,
+communication,soft,
+teamwork,soft,collaboration
+problem solving,soft,
+leadership,soft,
+project management,soft,
+stakeholder management,soft,
+agile,technical,scrum
+critical thinking,soft,
+attention to detail,soft,
+presentation skills,soft,
+mentoring,soft,
+c#,technical,csharp
+c,technical,
+matlab,tool,
+sas,tool,
+spss,tool,
+apache flink,tool,flink
+apache beam,tool,
+terraform,tool,
+jenkins,tool,
+jira,tool,
+confluence,tool,
+salesforce,tool,
+looker studio,tool,google data studio
+d3.js,tool,d3
+flask,tool,
+django,tool,
+fastapi,tool,
+node.js,technical,nodejs
+react,technical,reactjs
+html,technical,
+css,technical,
+data governance,technical,
+data quality,technical,
+data privacy,technical,
+gdpr,technical,
+model monitoring,technical,
+a/b test design,technical,
+experimentation,technical,
+causal inference,technical,
+bayesian statistics,technical,
+optimization,technical,
+linear programming,technical,
+supply chain analytics,technical,
+fraud detection,technical,
+anomaly detection,technical,
+churn prediction,technical,
+customer segmentation,technical,
+market basket analysis,technical,
+sentiment analysis,technical,
+topic modeling,technical,
+transformers,technical,
+bert,technical,
+gpt,technical,
+opencv,tool,
+image processing,technical,
+speech recognition,technical,
+reinforcement learning,technical,rl
+xgboost,tool,
+lightgbm,tool,
+random forest,technical,
+gradient boosting,technical,
