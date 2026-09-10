@@ -1,319 +1,173 @@
 """
 app.py
-Resume <-> Job Matching Tool - Streamlit App
+Resume ↔ Job Matching Tool — Streamlit App (v2)
 
 Run with: streamlit run app.py
 """
 
-import os
-import re
+# Load .env for local development (ignored on Streamlit Cloud)
+from dotenv import load_dotenv
+load_dotenv()
+
 import ast
+import json
+import os
+import sys
+
 import pandas as pd
 import streamlit as st
-import spacy
-import pdfplumber
-import plotly.graph_objects as go
-from spacy.matcher import PhraseMatcher
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
+# Make src/ importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from src.step1_utils import clean_text, extract_resume_text, segment_concatenated_skills
+from src.step2_extractor import SkillExtractor, get_available_industries, TAXONOMY_FILES
+from src.step3_matching import compute_match, compute_ats_score, detect_seniority_mismatch, get_benchmark_percentile
+from src.step4_suggestions import rank_missing_skills, generate_template_suggestions, generate_ai_suggestions
+from src.step5_charts import build_donut_chart, build_score_gauge, build_comparison_bar_chart
+from src.step6_scraper import fetch_job_from_url
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TAXONOMY_PATH = os.path.join(BASE_DIR, "data", "skills_taxonomy.csv")
 SAMPLE_RESUMES_PATH = os.path.join(BASE_DIR, "data", "ds_resumes_with_skills.csv")
-KEYWORD_WEIGHT = 0.4
-
-st.set_page_config(page_title="Resume <-> Job Matcher", page_icon="🧩", layout="wide")
-
 
 # ---------------------------------------------------------------------------
-# Text cleaning
+# Page config
 # ---------------------------------------------------------------------------
-def clean_text(text: str) -> str:
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-    text = re.sub(r"&\w+;", " ", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s\+\#\.\-]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def segment_concatenated_skills(text: str, skill_extractor) -> str:
-    """
-    Some job sites (e.g. Naukri 'Key Skills' sections) list skills back-to-back
-    with no space between them, e.g. "pythondata analysisdata analyticssql".
-    This inserts a space around every known skill phrase found in the text,
-    even mid-word, so the PhraseMatcher can pick them up individually.
-    """
-    forms = sorted(set(skill_extractor.surface_to_canonical.keys()), key=len, reverse=True)
-    for form in forms:
-        if len(form) < 3:
-            continue
-        text = re.sub(re.escape(form), f" {form} ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract raw text from an uploaded PDF file object."""
-    text_parts = []
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
-    return "\n".join(text_parts)
-
+st.set_page_config(
+    page_title="Resume ↔ Job Matcher",
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ---------------------------------------------------------------------------
-# Skill extractor
+# Custom CSS
 # ---------------------------------------------------------------------------
-class SkillExtractor:
-    def __init__(self, taxonomy_path: str, spacy_model: str = "en_core_web_sm"):
-        self.nlp = spacy.load(spacy_model)
-        self.matcher = PhraseMatcher(self.nlp.vocab, attr="LOWER")
-        self.taxonomy = pd.read_csv(taxonomy_path)
-        self._build_matcher()
+st.markdown("""
+<style>
+    /* Main background */
+    .stApp { background-color: #0f1117; }
 
-    def _build_matcher(self):
-        self.surface_to_canonical = {}
-        for _, row in self.taxonomy.iterrows():
-            canonical = str(row["skill_name"]).strip().lower()
-            surface_forms = [canonical]
-            if pd.notna(row.get("synonyms")) and str(row["synonyms"]).strip():
-                syns = [s.strip().lower() for s in str(row["synonyms"]).split(",") if s.strip()]
-                surface_forms.extend(syns)
-            for form in surface_forms:
-                self.surface_to_canonical[form] = canonical
+    /* Card-like containers */
+    div[data-testid="stExpander"] { border: 1px solid #1f2937; border-radius: 8px; }
 
-        patterns = [self.nlp.make_doc(form) for form in self.surface_to_canonical.keys()]
-        self.matcher.add("SKILL", patterns)
-
-    def extract(self, text: str) -> set:
-        if not isinstance(text, str) or not text.strip():
-            return set()
-        doc = self.nlp(text)
-        matches = self.matcher(doc)
-        found = set()
-        for match_id, start, end in matches:
-            span_text = doc[start:end].text.lower()
-            canonical = self.surface_to_canonical.get(span_text, span_text)
-            found.add(canonical)
-        return found
-
-
-# ---------------------------------------------------------------------------
-# Matching logic
-# ---------------------------------------------------------------------------
-def jaccard_similarity(skills_a: set, skills_b: set) -> float:
-    if not skills_a or not skills_b:
-        return 0.0
-    intersection = len(skills_a & skills_b)
-    union = len(skills_a | skills_b)
-    return intersection / union if union > 0 else 0.0
-
-
-def compute_match(resume_text_clean, resume_skills, resume_embedding,
-                   job_text_clean, job_skills, job_embedding,
-                   keyword_weight: float = KEYWORD_WEIGHT) -> dict:
-    jaccard = jaccard_similarity(resume_skills, job_skills)
-    semantic = cosine_similarity(
-        resume_embedding.reshape(1, -1), job_embedding.reshape(1, -1)
-    )[0][0]
-    final = keyword_weight * jaccard + (1 - keyword_weight) * semantic
-
-    return {
-        "jaccard": round(jaccard, 3),
-        "semantic": round(float(semantic), 3),
-        "final_score": round(float(final), 3),
-        "matched_skills": sorted(resume_skills & job_skills),
-        "missing_skills": sorted(job_skills - resume_skills),
+    /* Metric cards */
+    div[data-testid="metric-container"] {
+        background: #1a1d2e;
+        border: 1px solid #2d3748;
+        border-radius: 12px;
+        padding: 16px;
     }
 
+    /* Priority tags */
+    .tag-high   { background:#7f1d1d; color:#fca5a5; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
+    .tag-medium { background:#78350f; color:#fcd34d; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
+    .tag-low    { background:#1f2937; color:#9ca3af; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
 
-def score_missing_skill_priority(skill: str, job_title: str, job_text_clean: str,
-                                  extractor: "SkillExtractor") -> int:
-    """
-    Priority score for a missing skill based on how prominently it's
-    mentioned in the job posting. Higher = more important to add.
-    """
-    score = 0
-    title_clean = clean_text(job_title) if job_title else ""
+    /* AI badge */
+    .badge-ai   { background:#3730a3; color:#a5b4fc; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; }
+    .badge-tmpl { background:#1f2937; color:#6b7280; padding:2px 8px; border-radius:12px; font-size:11px; }
 
-    # Get all surface forms (synonyms) for this skill to check mentions properly
-    surface_forms = [
-        form for form, canonical in extractor.surface_to_canonical.items()
-        if canonical == skill
-    ]
-    if not surface_forms:
-        surface_forms = [skill]
+    /* Skill chips */
+    code { background:#1e293b !important; color:#7dd3fc !important; border-radius:6px !important; }
 
-    for form in surface_forms:
-        # Mentioned in the job title -> strong signal
-        if form in title_clean:
-            score += 5
-        # Count occurrences in the full description -> repeated emphasis
-        score += job_text_clean.count(form) * 2
-        # Mentioned in the first 200 characters -> usually requirements section
-        if form in job_text_clean[:200]:
-            score += 3
-
-    return score
+    /* Divider */
+    hr { border-color: #1f2937 !important; }
+</style>
+""", unsafe_allow_html=True)
 
 
-def rank_missing_skills(missing_skills: list, job_title: str, job_text_clean: str,
-                         extractor: "SkillExtractor") -> list:
-    """Return missing skills sorted by priority, each as (skill, priority_label)."""
-    scored = [
-        (skill, score_missing_skill_priority(skill, job_title, job_text_clean, extractor))
-        for skill in missing_skills
-    ]
-    scored.sort(key=lambda x: x[1], reverse=True)
+# ---------------------------------------------------------------------------
+# Sidebar — settings
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
 
-    ranked = []
-    for skill, score in scored:
-        if score >= 6:
-            label = "High"
-        elif score >= 2:
-            label = "Medium"
-        else:
-            label = "Low"
-        ranked.append((skill, label, score))
-    return ranked
-
-
-SUGGESTION_TEMPLATES = {
-    "technical": "Add a bullet describing a project or task where you applied {skill} — name the specific outcome (e.g. \"Used {skill} to reduce processing time by X%\").",
-    "tool": "Mention {skill} explicitly by name if you've used it, even briefly — recruiters and ATS systems often filter on exact tool names.",
-    "soft": "Demonstrate {skill} through a concrete example rather than listing it — e.g. describe a situation where you exercised {skill} and the result.",
-}
-
-
-def generate_suggestions(ranked_missing_skills: list, extractor: "SkillExtractor", top_n: int = 5) -> list:
-    """Generate phrasing suggestions for the top N priority missing skills."""
-    taxonomy_lookup = extractor.taxonomy.set_index(
-        extractor.taxonomy["skill_name"].str.strip().str.lower()
-    )["category"].to_dict()
-
-    suggestions = []
-    for skill, label, score in ranked_missing_skills[:top_n]:
-        category = taxonomy_lookup.get(skill, "technical")
-        template = SUGGESTION_TEMPLATES.get(category, SUGGESTION_TEMPLATES["technical"])
-        suggestions.append({
-            "skill": skill,
-            "priority": label,
-            "suggestion": template.format(skill=skill),
-        })
-    return suggestions
-
-
-def compute_ats_score(resume_text_raw: str, resume_clean: str, job_skills: set, resume_skills: set) -> dict:
-    """
-    Heuristic ATS (Applicant Tracking System) compatibility score.
-    Mirrors the kinds of checks real ATS parsers and ATS-scan tools perform:
-    structure, contact info, keyword coverage, and readability signals.
-    """
-    checks = []
-    points = 0
-    max_points = 0
-
-    # 1. Contact info present (email)
-    max_points += 15
-    has_email = bool(re.search(r"[\w\.-]+@[\w\.-]+\.\w+", resume_text_raw))
-    if has_email:
-        points += 15
-    checks.append(("Email address found", has_email))
-
-    # 2. Phone number present
-    max_points += 10
-    has_phone = bool(re.search(r"(\+?\d[\d\-\s]{8,}\d)", resume_text_raw))
-    if has_phone:
-        points += 10
-    checks.append(("Phone number found", has_phone))
-
-    # 3. Standard section headers present
-    max_points += 20
-    section_keywords = ["experience", "education", "skills", "project"]
-    sections_found = sum(1 for kw in section_keywords if kw in resume_clean)
-    section_score = int((sections_found / len(section_keywords)) * 20)
-    points += section_score
-    checks.append((f"Standard resume sections found ({sections_found}/{len(section_keywords)})", sections_found >= 3))
-
-    # 4. Keyword / skill coverage vs this specific job
-    max_points += 35
-    if job_skills:
-        coverage = len(resume_skills & job_skills) / len(job_skills)
-    else:
-        coverage = 0
-    keyword_score = int(coverage * 35)
-    points += keyword_score
-    checks.append((f"Job keyword coverage ({int(coverage*100)}%)", coverage >= 0.4))
-
-    # 5. Resume length (too short = incomplete, too long = ATS may truncate)
-    max_points += 10
-    word_count = len(resume_clean.split())
-    length_ok = 200 <= word_count <= 1200
-    if length_ok:
-        points += 10
-    checks.append((f"Resume length reasonable ({word_count} words)", length_ok))
-
-    # 6. Quantifiable achievements (numbers/percentages present)
-    max_points += 10
-    has_numbers = bool(re.search(r"\d+%|\d+\+|\b\d{2,}\b", resume_text_raw))
-    if has_numbers:
-        points += 10
-    checks.append(("Quantifiable achievements found (numbers/%)", has_numbers))
-
-    final_pct = int((points / max_points) * 100) if max_points > 0 else 0
-
-    return {"score": final_pct, "checks": checks}
-
-
-def build_donut_chart(matched_count: int, missing_count: int) -> go.Figure:
-    """Hollow donut chart showing matched vs missing skill counts."""
-    labels = ["Matched", "Missing"]
-    values = [matched_count, missing_count]
-    colors = ["#22c55e", "#ef4444"]  # green / red
-
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=0.65,
-        marker=dict(colors=colors, line=dict(color="#0e1117", width=2)),
-        textinfo="label+value",
-        textfont=dict(size=13, color="white"),
-        hoverinfo="label+percent",
-    )])
-
-    total = matched_count + missing_count
-    coverage_pct = int((matched_count / total) * 100) if total > 0 else 0
-
-    fig.update_layout(
-        showlegend=False,
-        margin=dict(t=10, b=10, l=10, r=10),
-        height=260,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        annotations=[dict(
-            text=f"<b>{coverage_pct}%</b><br><span style='font-size:11px'>coverage</span>",
-            x=0.5, y=0.5, font=dict(size=22, color="white"), showarrow=False
-        )],
+    industry = st.selectbox(
+        "🏭 Industry preset",
+        get_available_industries(),
+        help="Select the industry to load the matching skills taxonomy for.",
     )
-    return fig
+
+    keyword_weight = st.slider(
+        "🔑 Keyword vs Semantic weight",
+        min_value=0.0, max_value=1.0, value=0.4, step=0.05,
+        help=(
+            "Higher = more weight on exact skill keyword matching. "
+            "Lower = more weight on AI semantic similarity."
+        ),
+    )
+
+    model_choice = st.selectbox(
+        "🤖 Embedding model",
+        ["Fast — all-MiniLM-L6-v2 (~80 MB)", "Accurate — all-mpnet-base-v2 (~420 MB)"],
+        help="Accurate model gives better semantic matching but is slower and larger to download.",
+    )
+    model_name = (
+        "all-MiniLM-L6-v2"
+        if "MiniLM" in model_choice
+        else "all-mpnet-base-v2"
+    )
+
+    st.divider()
+    st.markdown("## 🔑 AI Rewrites (Optional)")
+
+    # Load key silently — checks Streamlit Cloud secrets first, then local .env
+    # Never expose the key value in the UI
+    try:
+        _env_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        _env_key = ""
+    if not _env_key:
+        _env_key = os.getenv("GEMINI_API_KEY", "")
+
+    if _env_key:
+        # Key found in environment — show badge only, never display the key
+        gemini_api_key = _env_key
+        st.success("✅ AI rewrites enabled")
+        st.caption("🔒 API key loaded securely from environment.")
+    else:
+        # No env key — let the user paste their own (empty field, no pre-fill)
+        st.caption(
+            "Enter your free Gemini API key to get AI-generated, copy-paste-ready "
+            "resume bullet rewrites instead of generic suggestions.\n\n"
+            "[Get a free key →](https://aistudio.google.com/app/apikey)"
+        )
+        gemini_api_key = st.text_input(
+            "Gemini API key",
+            value="",
+            type="password",
+            placeholder="AIza...",
+            help="Your key is only used for this session and never stored.",
+        )
+        if gemini_api_key:
+            st.success("✅ AI rewrites enabled")
+
+    st.divider()
+    st.markdown(
+        "**How scoring works**\n\n"
+        f"Final score = {int(keyword_weight*100)}% keyword overlap + "
+        f"{int((1-keyword_weight)*100)}% semantic similarity"
+    )
+    st.caption("v2.0 · Made with ❤️ using spaCy + Sentence Transformers")
 
 
 # ---------------------------------------------------------------------------
-# Cached resources (loaded once per session)
+# Cached resources — reload when industry or model changes
 # ---------------------------------------------------------------------------
 @st.cache_resource
-def load_skill_extractor():
-    return SkillExtractor(taxonomy_path=TAXONOMY_PATH)
+def load_skill_extractor(industry_key: str):
+    taxonomy_path = TAXONOMY_FILES[industry_key]
+    return SkillExtractor(taxonomy_path=taxonomy_path)
 
 
 @st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+def load_embedding_model(model_id: str):
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_id)
 
 
 @st.cache_data
@@ -325,54 +179,298 @@ def load_sample_resumes():
     return df
 
 
-extractor = load_skill_extractor()
-model = load_embedding_model()
+extractor = load_skill_extractor(industry)
+embed_model = load_embedding_model(model_name)
 sample_resumes = load_sample_resumes()
 has_sample_resumes = len(sample_resumes) > 0
 
 
 # ---------------------------------------------------------------------------
-# UI
+# Session state initialisation
 # ---------------------------------------------------------------------------
-st.title("🧩 Resume ↔ Job Matching Tool")
-st.caption(
-    "Pick a sample resume, paste a job description, and see how well they match — "
-    "combining keyword overlap and semantic (AI) similarity."
-)
+def init_session():
+    defaults = {
+        "resume_text_raw": None,
+        "resume_clean": None,
+        "resume_skills": None,
+        "resume_embedding": None,
+        "resume_source_label": None,
+        "job_bank": [],           # list of {"label", "title", "text_raw", "text_clean"}
+        "compare_results": [],    # list of result dicts
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-col1, col2 = st.columns(2)
+init_session()
 
-with col1:
-    st.subheader("1. Choose a resume")
-    source_options = ["Upload a resume (PDF)"]
+
+# ---------------------------------------------------------------------------
+# Helper: run full analysis for one job
+# ---------------------------------------------------------------------------
+def run_analysis(job_title: str, job_text_raw: str) -> dict:
+    job_clean = clean_text(job_text_raw)
+    job_skills = extractor.extract(segment_concatenated_skills(job_clean, extractor))
+    job_embedding = embed_model.encode(job_clean)
+
+    result = compute_match(
+        st.session_state.resume_clean,
+        st.session_state.resume_skills,
+        st.session_state.resume_embedding,
+        job_clean,
+        job_skills,
+        job_embedding,
+        keyword_weight=keyword_weight,
+    )
+    result["ats"] = compute_ats_score(
+        st.session_state.resume_text_raw,
+        st.session_state.resume_clean,
+        job_skills,
+        st.session_state.resume_skills,
+    )
+    result["seniority"] = detect_seniority_mismatch(
+        st.session_state.resume_clean, job_clean, job_title
+    )
+    result["benchmark"] = get_benchmark_percentile(result["final_score"])
+    result["job_title"] = job_title
+    result["job_clean"] = job_clean
+    result["job_text_raw"] = job_text_raw
+    result["job_skills"] = job_skills
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Helper: render full result panel
+# ---------------------------------------------------------------------------
+def render_result(result: dict, expanded: bool = True):
+    score_pct = int(result["final_score"] * 100)
+    ats_score = result["ats"]["score"]
+    benchmark = result["benchmark"]
+
+    # Score banner
+    st.markdown(f"""
+    <div style='background:linear-gradient(135deg,#1a1d2e,#0f1117);
+                border:1px solid #2d3748;border-radius:16px;padding:20px 24px;margin-bottom:16px;'>
+        <div style='display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>
+            <div>
+                <div style='font-size:48px;font-weight:800;color:{"#22c55e" if score_pct>=70 else "#f59e0b" if score_pct>=50 else "#ef4444"};line-height:1;'>
+                    {score_pct}%
+                </div>
+                <div style='color:#9ca3af;font-size:14px;margin-top:4px;'>Overall Match</div>
+            </div>
+            <div style='flex:1;min-width:200px;'>
+                <div style='color:#d1d5db;font-size:14px;margin-bottom:8px;'>
+                    🏆 Your resume scores better than ~<b>{benchmark}%</b> of applicants (estimated)
+                </div>
+                <div style='background:#1f2937;border-radius:8px;height:8px;'>
+                    <div style='background:{"#22c55e" if score_pct>=70 else "#f59e0b" if score_pct>=50 else "#ef4444"};
+                                width:{score_pct}%;height:8px;border-radius:8px;'></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Key metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔑 Keyword Overlap", f"{int(result['jaccard'] * 100)}%")
+    m2.metric("🧠 Semantic Similarity", f"{int(result['semantic'] * 100)}%")
+    m3.metric("📋 ATS Score", f"{ats_score}/100",
+              delta="Good" if ats_score >= 75 else ("Needs work" if ats_score >= 50 else "Weak"),
+              delta_color="normal" if ats_score >= 75 else "inverse")
+    m4.metric("🎯 Skills Matched", f"{len(result['matched_skills'])}/{len(result['matched_skills'])+len(result['missing_skills'])}")
+
+    # Seniority warning
+    if result.get("seniority"):
+        if result["seniority"]["type"] == "underqualified":
+            st.warning(result["seniority"]["message"])
+        else:
+            st.info(result["seniority"]["message"])
+
+    st.divider()
+
+    # ATS checks
+    with st.expander("📋 ATS Compatibility Details", expanded=False):
+        for check_label, passed in result["ats"]["checks"]:
+            icon = "✅" if passed else "⚠️"
+            st.write(f"{icon} {check_label}")
+        st.caption(
+            "Heuristic estimate based on structure, contact info, keyword coverage, "
+            "and readability — not a simulation of any real ATS product."
+        )
+
+    # Skill coverage
+    st.markdown("### 📊 Skill Coverage")
+    chart_col, legend_col = st.columns([1, 2])
+    with chart_col:
+        fig = build_donut_chart(len(result["matched_skills"]), len(result["missing_skills"]))
+        st.plotly_chart(fig, use_container_width=True)
+    with legend_col:
+        st.markdown(f"🟢 **Matched:** {len(result['matched_skills'])} skills")
+        st.markdown(f"🔴 **Missing:** {len(result['missing_skills'])} skills")
+        st.caption(
+            "Coverage = share of the job's required skills your resume already mentions. "
+            "Based on exact skill-name matches from the taxonomy."
+        )
+
+    # Matched / missing skills side by side
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("### ✅ Matched Skills")
+        if result["matched_skills"]:
+            st.write(" ".join([f"`{s}`" for s in result["matched_skills"]]))
+        else:
+            st.write("No exact skill overlap found.")
+
+    with col_b:
+        st.markdown("### ❌ Missing Skills")
+        if result["missing_skills"]:
+            ranked_missing = rank_missing_skills(
+                result["missing_skills"],
+                result.get("job_title", ""),
+                result["job_clean"],
+                extractor,
+            )
+            priority_colors = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
+            for skill, label, score in ranked_missing:
+                st.markdown(
+                    f"{priority_colors[label]} `{skill}` — "
+                    f"<span class='tag-{label.lower()}'>{label} priority</span>",
+                    unsafe_allow_html=True,
+                )
+            st.caption("Priority = how often the skill appears in the job posting + title.")
+        else:
+            ranked_missing = []
+            st.success("No missing skills detected — strong match! 🎉")
+
+    # Suggestions
+    if result["missing_skills"]:
+        st.markdown("### 💡 How to Improve Your Resume")
+
+        if gemini_api_key:
+            with st.spinner("🤖 Generating AI-powered bullet rewrites..."):
+                suggestions = generate_ai_suggestions(
+                    ranked_missing,
+                    result["job_text_raw"],
+                    st.session_state.resume_text_raw,
+                    gemini_api_key,
+                    top_n=5,
+                )
+            if not suggestions:
+                st.caption("AI generation failed — falling back to templates.")
+                suggestions = generate_template_suggestions(ranked_missing, extractor, top_n=5)
+        else:
+            suggestions = generate_template_suggestions(ranked_missing, extractor, top_n=5)
+
+        for s in suggestions:
+            badge = (
+                "<span class='badge-ai'>✨ AI</span>"
+                if s.get("ai_powered")
+                else "<span class='badge-tmpl'>template</span>"
+            )
+            priority_tag = f"<span class='tag-{s['priority'].lower()}'>{s['priority']}</span>"
+            st.markdown(
+                f"**{s['skill']}** {priority_tag} {badge}<br>"
+                f"{s['suggestion']}",
+                unsafe_allow_html=True,
+            )
+            st.write("")
+
+    # Download report
+    st.divider()
+    report = {
+        "job_title": result.get("job_title", ""),
+        "overall_match_pct": int(result["final_score"] * 100),
+        "keyword_overlap_pct": int(result["jaccard"] * 100),
+        "semantic_similarity_pct": int(result["semantic"] * 100),
+        "ats_score": result["ats"]["score"],
+        "benchmark_beats_pct": result["benchmark"],
+        "matched_skills": result["matched_skills"],
+        "missing_skills": result["missing_skills"],
+        "seniority_flag": result.get("seniority"),
+    }
+    st.download_button(
+        "⬇️ Download Report (JSON)",
+        data=json.dumps(report, indent=2),
+        file_name=f"match_report_{result.get('job_title','job').replace(' ','_')[:30]}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    with st.expander("ℹ️ How this score is calculated"):
+        st.markdown(f"""
+        - **Keyword overlap (Jaccard):** Measures exact skill-word overlap between resume and job. Weight: **{int(keyword_weight*100)}%**
+        - **Semantic similarity:** Uses AI embeddings (`{model_name}`) to compare overall meaning, catching related skills phrased differently. Weight: **{int((1-keyword_weight)*100)}%**
+        - **Final score** = weighted average of both
+        - **ATS score** = heuristic based on structure, contact info, keyword coverage, resume length, and quantifiable achievements
+        - **Benchmark** = estimated percentile vs. a typical distribution of applicant scores
+        """)
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.markdown("""
+<h1 style='text-align:center;background:linear-gradient(90deg,#6366f1,#8b5cf6,#ec4899);
+           -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+           font-size:2.5rem;margin-bottom:4px;'>
+    🧩 Resume ↔ Job Matcher
+</h1>
+<p style='text-align:center;color:#9ca3af;font-size:1rem;margin-bottom:24px;'>
+    Upload your resume once · Compare multiple jobs · Get AI-powered improvement tips
+</p>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Resume (persists in session)
+# ---------------------------------------------------------------------------
+st.markdown("## Step 1 — Load Your Resume")
+
+resume_loaded = st.session_state.resume_text_raw is not None
+
+if resume_loaded:
+    st.success(
+        f"✅ Resume loaded: **{st.session_state.resume_source_label}** "
+        f"({len(st.session_state.resume_text_raw.split())} words, "
+        f"{len(st.session_state.resume_skills)} skills extracted)"
+    )
+    if st.button("🔄 Load a different resume", use_container_width=False):
+        for k in ["resume_text_raw", "resume_clean", "resume_skills",
+                  "resume_embedding", "resume_source_label"]:
+            st.session_state[k] = None
+        st.rerun()
+else:
+    source_options = ["Upload a resume (PDF or DOCX)"]
     if has_sample_resumes:
         source_options.append("Use a sample resume")
 
-    resume_source = st.radio(
-        "Resume source",
-        source_options,
-        horizontal=True,
-    )
+    resume_source = st.radio("Resume source", source_options, horizontal=True)
 
-    uploaded_resume_text = None
-    selected_resume = None
-
-    if resume_source == "Upload a resume (PDF)":
+    if resume_source == "Upload a resume (PDF or DOCX)":
         uploaded_file = st.file_uploader(
-            "Upload your resume or a friend's resume (PDF)", type=["pdf"]
+            "Upload your resume", type=["pdf", "docx"]
         )
-        if uploaded_file is not None:
-            with st.spinner("Reading PDF..."):
-                uploaded_resume_text = extract_text_from_pdf(uploaded_file)
-            if uploaded_resume_text.strip():
-                st.success(f"Extracted {len(uploaded_resume_text)} characters from the PDF.")
+        if uploaded_file:
+            with st.spinner("Reading file..."):
+                text, err = extract_resume_text(uploaded_file)
+            if err:
+                st.error(err)
+            elif text:
+                st.success(f"Extracted {len(text.split())} words from **{uploaded_file.name}**")
                 with st.expander("Preview extracted text"):
-                    st.write(uploaded_resume_text[:1500] + "...")
-            else:
-                st.error(
-                    "Couldn't extract text from this PDF — it may be a scanned image "
-                    "rather than selectable text. Try a different file."
-                )
+                    st.write(text[:1500] + ("..." if len(text) > 1500 else ""))
+                if st.button("✅ Use this resume", type="primary"):
+                    with st.spinner("Processing resume..."):
+                        clean = clean_text(text)
+                        skills = extractor.extract(segment_concatenated_skills(clean, extractor))
+                        embedding = embed_model.encode(clean)
+                    st.session_state.resume_text_raw = text
+                    st.session_state.resume_clean = clean
+                    st.session_state.resume_skills = skills
+                    st.session_state.resume_embedding = embedding
+                    st.session_state.resume_source_label = uploaded_file.name
+                    st.rerun()
     else:
         resume_options = sample_resumes.apply(
             lambda r: f"{r['Category']} — Resume #{r.name}", axis=1
@@ -382,138 +480,304 @@ with col1:
         selected_resume = sample_resumes.iloc[selected_idx]
 
         with st.expander("Preview resume text"):
-            st.write(selected_resume["Resume_str"][:1500] + "...")
+            st.write(str(selected_resume["Resume_str"])[:1500] + "...")
 
-with col2:
-    st.subheader("2. Paste a job description")
-    job_title_input = st.text_input("Job title (optional, improves skill priority ranking)", placeholder="e.g. Senior Data Engineer")
-    job_text = st.text_area(
-        "Job description",
-        height=220,
-        placeholder="Paste the full job description here...",
-    )
-
-analyze_clicked = st.button("🔍 Analyze Match", type="primary", use_container_width=True)
+        if st.button("✅ Use this resume", type="primary"):
+            with st.spinner("Processing sample resume..."):
+                raw = selected_resume["Resume_str"]
+                clean = (
+                    selected_resume["Resume_clean"]
+                    if "Resume_clean" in selected_resume
+                    else clean_text(raw)
+                )
+                skills = set(selected_resume["skills"]) if isinstance(selected_resume["skills"], list) else selected_resume["skills"]
+                embedding = embed_model.encode(clean)
+            st.session_state.resume_text_raw = raw
+            st.session_state.resume_clean = clean
+            st.session_state.resume_skills = skills
+            st.session_state.resume_embedding = embedding
+            st.session_state.resume_source_label = selected_label
+            st.rerun()
 
 st.divider()
 
-if analyze_clicked:
-    have_resume = (uploaded_resume_text and uploaded_resume_text.strip()) or (selected_resume is not None)
+# ---------------------------------------------------------------------------
+# Tabs — only show after resume is loaded
+# ---------------------------------------------------------------------------
+if not resume_loaded:
+    st.info("⬆️ Load your resume above to get started.")
+    st.stop()
 
-    if not job_text.strip():
-        st.warning("Please paste a job description first.")
-    elif not have_resume:
-        st.warning("Please upload a resume or select a sample resume first.")
+tab1, tab2, tab3 = st.tabs([
+    "🔍 Analyze Single Job",
+    "📊 Compare Multiple Jobs",
+    "✏️ Resume Editor (Live Score)",
+])
+
+
+# ===========================================================================
+# TAB 1 — Single Job Analysis
+# ===========================================================================
+with tab1:
+    st.markdown("## Step 2 — Enter a Job Description")
+
+    job_title_input = st.text_input(
+        "Job title (optional — improves skill priority ranking)",
+        placeholder="e.g. Senior Data Engineer",
+        key="tab1_title",
+    )
+
+    job_input_method = st.radio(
+        "How do you want to provide the job?",
+        ["📋 Paste job description", "🔗 Paste job URL (auto-fetch)"],
+        horizontal=True,
+        key="tab1_method",
+    )
+
+    job_text_raw = ""
+
+    if job_input_method == "📋 Paste job description":
+        job_text_raw = st.text_area(
+            "Job description",
+            height=200,
+            placeholder="Paste the full job description here...",
+            key="tab1_paste",
+        )
     else:
-        with st.spinner("Analyzing..."):
-            if uploaded_resume_text and uploaded_resume_text.strip():
-                # Resume side (computed live from uploaded PDF)
-                resume_text_raw = uploaded_resume_text
-                resume_clean = clean_text(uploaded_resume_text)
-                resume_skills = extractor.extract(segment_concatenated_skills(resume_clean, extractor))
-            else:
-                # Resume side (already precomputed for sample resumes)
-                resume_text_raw = selected_resume["Resume_str"]
-                resume_clean = selected_resume["Resume_clean"] if "Resume_clean" in selected_resume else clean_text(selected_resume["Resume_str"])
-                resume_skills = selected_resume["skills"]
+        job_url = st.text_input(
+            "Job posting URL",
+            placeholder="https://indeed.com/viewjob?jk=...",
+            key="tab1_url",
+        )
+        if job_url:
+            if st.button("🌐 Fetch job description", key="tab1_fetch"):
+                with st.spinner("Fetching job description..."):
+                    fetched_text, fetch_err = fetch_job_from_url(job_url)
+                if fetch_err:
+                    st.error(fetch_err)
+                elif fetched_text:
+                    st.session_state["tab1_fetched"] = fetched_text
+                    st.success(f"Fetched {len(fetched_text.split())} words from URL.")
 
-            resume_embedding = model.encode(resume_clean)
+        if "tab1_fetched" in st.session_state and st.session_state["tab1_fetched"]:
+            job_text_raw = st.session_state["tab1_fetched"]
+            with st.expander("Preview fetched text"):
+                st.write(job_text_raw[:1000] + "...")
 
-            # Job side (computed live from pasted text)
-            job_clean = clean_text(job_text)
-            job_skills = extractor.extract(segment_concatenated_skills(job_clean, extractor))
-            job_embedding = model.encode(job_clean)
+    if st.button("🔍 Analyze Match", type="primary", use_container_width=True, key="tab1_analyze"):
+        if not job_text_raw.strip():
+            st.warning("Please provide a job description first.")
+        else:
+            with st.spinner("Analyzing..."):
+                result = run_analysis(job_title_input, job_text_raw)
+            render_result(result)
 
-            result = compute_match(
-                resume_clean, resume_skills, resume_embedding,
-                job_clean, job_skills, job_embedding
-            )
 
-            ats_result = compute_ats_score(resume_text_raw, resume_clean, job_skills, resume_skills)
+# ===========================================================================
+# TAB 2 — Multi-Job Comparison
+# ===========================================================================
+with tab2:
+    st.markdown("## Compare Your Resume Against Multiple Jobs")
+    st.caption("Add up to 5 jobs and see them ranked by match score.")
 
-        # --- Display results ---
-        score_pct = int(result["final_score"] * 100)
-
-        st.subheader("Results")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Overall Match", f"{score_pct}%")
-        m2.metric("Keyword Overlap", f"{int(result['jaccard'] * 100)}%")
-        m3.metric("Semantic Similarity", f"{int(result['semantic'] * 100)}%")
-
-        st.progress(result["final_score"])
-
-        st.markdown("### 🤖 ATS Compatibility Score")
-        ats_col1, ats_col2 = st.columns([1, 2])
-        with ats_col1:
-            ats_score = ats_result["score"]
-            if ats_score >= 75:
-                st.success(f"{ats_score}/100 — Good")
-            elif ats_score >= 50:
-                st.warning(f"{ats_score}/100 — Needs work")
-            else:
-                st.error(f"{ats_score}/100 — Weak")
-        with ats_col2:
-            for check_label, passed in ats_result["checks"]:
-                icon = "✅" if passed else "⚠️"
-                st.write(f"{icon} {check_label}")
-        st.caption(
-            "This estimates how well an Applicant Tracking System might parse and rank this resume "
-            "for this specific job — based on structure, contact info, keyword coverage, and readability. "
-            "Not a guarantee of any real ATS's exact scoring."
+    with st.expander("➕ Add a Job", expanded=len(st.session_state.job_bank) == 0):
+        cj_title = st.text_input("Job title", placeholder="e.g. Data Scientist at Google", key="cj_title")
+        cj_method = st.radio(
+            "Input method",
+            ["📋 Paste text", "🔗 Paste URL"],
+            horizontal=True,
+            key="cj_method",
         )
 
-        st.divider()
+        cj_text = ""
+        if cj_method == "📋 Paste text":
+            cj_text = st.text_area("Job description", height=150, key="cj_paste")
+        else:
+            cj_url = st.text_input("Job URL", placeholder="https://...", key="cj_url")
+            if cj_url and st.button("🌐 Fetch", key="cj_fetch"):
+                with st.spinner("Fetching..."):
+                    cj_fetched, cj_err = fetch_job_from_url(cj_url)
+                if cj_err:
+                    st.error(cj_err)
+                else:
+                    st.session_state["cj_fetched"] = cj_fetched
+                    st.success(f"Fetched {len(cj_fetched.split())} words.")
+            if "cj_fetched" in st.session_state:
+                cj_text = st.session_state.get("cj_fetched", "")
+                st.caption(f"Using fetched text ({len(cj_text.split())} words)")
 
-        st.markdown("### 📊 Skill Coverage")
-        chart_col, legend_col = st.columns([1, 2])
-        with chart_col:
-            matched_count = len(result["matched_skills"])
-            missing_count = len(result["missing_skills"])
-            fig = build_donut_chart(matched_count, missing_count)
-            st.plotly_chart(fig, use_container_width=True)
-        with legend_col:
-            st.markdown(f"🟢 **Matched skills:** {matched_count}")
-            st.markdown(f"🔴 **Missing skills:** {missing_count}")
-            st.caption(
-                "Coverage = share of the job's required skills your resume already mentions. "
-                "This is based on exact skill-name matches, not overall fit."
+        if st.button("➕ Add to comparison", key="cj_add", type="primary"):
+            if not cj_text.strip():
+                st.warning("Please provide a job description.")
+            elif len(st.session_state.job_bank) >= 5:
+                st.warning("Maximum 5 jobs. Remove one first.")
+            else:
+                label = cj_title.strip() or f"Job {len(st.session_state.job_bank) + 1}"
+                st.session_state.job_bank.append({
+                    "label": label,
+                    "title": cj_title.strip(),
+                    "text_raw": cj_text,
+                })
+                st.session_state.pop("cj_fetched", None)
+                st.success(f"Added: **{label}**")
+                st.rerun()
+
+    if st.session_state.job_bank:
+        st.markdown(f"### {len(st.session_state.job_bank)} Job(s) in comparison")
+
+        # Remove buttons
+        for i, job in enumerate(st.session_state.job_bank):
+            col_l, col_r = st.columns([4, 1])
+            col_l.markdown(f"**{i+1}.** {job['label']}")
+            if col_r.button("🗑️ Remove", key=f"remove_{i}"):
+                st.session_state.job_bank.pop(i)
+                st.rerun()
+
+        if st.button("⚡ Run Comparison", type="primary", use_container_width=True, key="cj_run"):
+            compare_results = []
+            progress = st.progress(0)
+            for i, job in enumerate(st.session_state.job_bank):
+                with st.spinner(f"Analyzing: {job['label']}..."):
+                    r = run_analysis(job["title"], job["text_raw"])
+                    r["label"] = job["label"]
+                    compare_results.append(r)
+                progress.progress((i + 1) / len(st.session_state.job_bank))
+            st.session_state.compare_results = compare_results
+
+        if st.session_state.compare_results:
+            results = sorted(st.session_state.compare_results, key=lambda x: x["final_score"], reverse=True)
+
+            # Summary table
+            st.markdown("### 📊 Ranked Results")
+            table_data = []
+            for rank, r in enumerate(results, 1):
+                score_pct = int(r["final_score"] * 100)
+                emoji = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+                table_data.append({
+                    "Rank": emoji,
+                    "Job": r["label"],
+                    "Overall Match": f"{score_pct}%",
+                    "Keywords": f"{int(r['jaccard']*100)}%",
+                    "Semantic": f"{int(r['semantic']*100)}%",
+                    "ATS": f"{r['ats']['score']}/100",
+                    "Matched Skills": len(r["matched_skills"]),
+                    "Missing Skills": len(r["missing_skills"]),
+                })
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+            # Bar chart
+            st.plotly_chart(
+                build_comparison_bar_chart(results),
+                use_container_width=True,
             )
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("### ✅ Matched Skills")
-            if result["matched_skills"]:
-                st.write(" ".join([f"`{s}`" for s in result["matched_skills"]]))
-            else:
-                st.write("No exact skill overlap found.")
+            # Expandable details per job
+            st.markdown("### 📂 Detailed Results per Job")
+            for r in results:
+                with st.expander(f"{r['label']} — {int(r['final_score']*100)}% match"):
+                    render_result(r, expanded=False)
 
-        with col_b:
-            st.markdown("### ❌ Missing Skills")
-            if result["missing_skills"]:
-                ranked_missing = rank_missing_skills(
-                    result["missing_skills"], job_title_input, job_clean, extractor
+
+# ===========================================================================
+# TAB 3 — Live Resume Editor
+# ===========================================================================
+with tab3:
+    st.markdown("## ✏️ Resume Editor — See Your Score Update Live")
+    st.caption(
+        "Edit your resume text below and pick a job to score against. "
+        "The score updates every time you click **Re-score**."
+    )
+
+    editor_col, job_col = st.columns([3, 2])
+
+    with editor_col:
+        st.markdown("#### Your Resume (editable)")
+        edited_resume = st.text_area(
+            "Resume text",
+            value=st.session_state.resume_text_raw or "",
+            height=400,
+            key="editor_resume",
+            label_visibility="collapsed",
+        )
+
+    with job_col:
+        st.markdown("#### Job to score against")
+        editor_job_title = st.text_input("Job title", placeholder="e.g. Data Analyst", key="editor_title")
+        editor_job_text = st.text_area(
+            "Job description",
+            height=280,
+            placeholder="Paste a job description...",
+            key="editor_job",
+        )
+
+    if st.button("🔄 Re-score", type="primary", use_container_width=True, key="editor_score"):
+        if not edited_resume.strip():
+            st.warning("Resume text is empty.")
+        elif not editor_job_text.strip():
+            st.warning("Please paste a job description to score against.")
+        else:
+            with st.spinner("Scoring..."):
+                # Temporarily use the edited resume for scoring
+                edited_clean = clean_text(edited_resume)
+                edited_skills = extractor.extract(segment_concatenated_skills(edited_clean, extractor))
+                edited_embedding = embed_model.encode(edited_clean)
+
+                job_clean = clean_text(editor_job_text)
+                job_skills = extractor.extract(segment_concatenated_skills(job_clean, extractor))
+                job_embedding = embed_model.encode(job_clean)
+
+                result = compute_match(
+                    edited_clean, edited_skills, edited_embedding,
+                    job_clean, job_skills, job_embedding,
+                    keyword_weight=keyword_weight,
                 )
-                priority_colors = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
-                for skill, label, score in ranked_missing:
-                    st.write(f"{priority_colors[label]} `{skill}` — **{label} priority**")
-                st.caption("Priority is based on how often the skill is mentioned in the job posting, and whether it appears in the title.")
+
+            score_pct = int(result["final_score"] * 100)
+
+            # Before/after delta if session resume exists
+            original_skills = st.session_state.resume_skills or set()
+            original_embedding = st.session_state.resume_embedding
+            if original_embedding is not None:
+                from src.matching import compute_match as _cm
+                orig_result = _cm(
+                    st.session_state.resume_clean,
+                    original_skills,
+                    original_embedding,
+                    job_clean,
+                    job_skills,
+                    job_embedding,
+                    keyword_weight=keyword_weight,
+                )
+                orig_pct = int(orig_result["final_score"] * 100)
+                delta = score_pct - orig_pct
+                delta_str = f"+{delta}%" if delta >= 0 else f"{delta}%"
+                st.metric(
+                    "📈 Match Score (edited resume)",
+                    f"{score_pct}%",
+                    delta=delta_str,
+                    delta_color="normal" if delta >= 0 else "inverse",
+                )
+                if delta > 0:
+                    st.success(f"Your edits improved the match by **{delta} percentage points**! 🎉")
+                elif delta < 0:
+                    st.warning(f"Your edits lowered the match by {abs(delta)} points.")
+                else:
+                    st.info("Score unchanged.")
             else:
-                st.write("No missing skills detected — strong match!")
-                ranked_missing = []
+                st.metric("Match Score", f"{score_pct}%")
 
-        if result["missing_skills"]:
-            st.markdown("### 💡 Suggestions to Improve Your Match")
-            suggestions = generate_suggestions(ranked_missing, extractor, top_n=5)
-            for s in suggestions:
-                st.markdown(f"**{s['skill']}** ({s['priority']} priority) — {s['suggestion']}")
+            col_x, col_y = st.columns(2)
+            with col_x:
+                st.markdown("**✅ Matched Skills**")
+                st.write(" ".join([f"`{s}`" for s in sorted(result["matched_skills"])]) or "None")
+            with col_y:
+                st.markdown("**❌ Missing Skills**")
+                st.write(" ".join([f"`{s}`" for s in sorted(result["missing_skills"])]) or "None")
 
-        with st.expander("How this score is calculated"):
-            st.markdown(
-                f"""
-                - **Keyword overlap (Jaccard)**: measures exact skill-word overlap between resume and job. Weight: {int(KEYWORD_WEIGHT*100)}%
-                - **Semantic similarity**: uses AI embeddings to compare overall meaning, catching related skills phrased differently. Weight: {int((1-KEYWORD_WEIGHT)*100)}%
-                - **Final score** = weighted average of both
-                """
-            )
-else:
-    st.info("Select a resume, paste a job description, and click **Analyze Match** to see results.")
+            if st.button("💾 Save edited resume to session", key="save_edited"):
+                st.session_state.resume_text_raw = edited_resume
+                st.session_state.resume_clean = edited_clean
+                st.session_state.resume_skills = edited_skills
+                st.session_state.resume_embedding = edited_embedding
+                st.session_state.resume_source_label = "Edited resume"
+                st.success("Saved! Your edited resume is now active across all tabs.")

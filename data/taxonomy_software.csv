@@ -1,0 +1,81 @@
+skill_name,category,synonyms
+python,technical,
+java,technical,
+javascript,technical,js
+typescript,technical,ts
+c++,technical,cpp
+c#,technical,csharp
+go,technical,golang
+rust,technical,
+ruby,technical,
+kotlin,technical,
+swift,technical,
+php,technical,
+scala,technical,
+sql,technical,structured query language
+html,technical,
+css,technical,
+react,technical,reactjs
+angular,technical,angularjs
+vue,technical,vuejs
+node.js,technical,nodejs
+django,technical,
+flask,technical,
+fastapi,technical,
+spring boot,technical,spring
+express.js,technical,expressjs
+rest api,technical,restful api
+graphql,technical,
+grpc,technical,
+websockets,technical,
+microservices,technical,
+docker,tool,
+kubernetes,tool,k8s
+terraform,tool,
+ansible,tool,
+jenkins,tool,
+github actions,tool,
+ci/cd,technical,continuous integration
+git,tool,
+github,tool,
+gitlab,tool,
+linux,technical,unix
+bash,technical,shell scripting
+aws,tool,amazon web services
+azure,tool,microsoft azure
+gcp,tool,google cloud platform
+postgresql,tool,postgres
+mysql,tool,
+mongodb,tool,
+redis,tool,
+elasticsearch,tool,
+kafka,tool,apache kafka
+rabbitmq,tool,
+nosql,technical,
+data structures,technical,
+algorithms,technical,
+system design,technical,
+object oriented programming,technical,oop
+functional programming,technical,
+design patterns,technical,
+unit testing,technical,
+integration testing,technical,
+test driven development,technical,tdd
+agile,technical,scrum
+jira,tool,
+confluence,tool,
+code review,technical,
+debugging,technical,
+performance optimization,technical,
+security,technical,cybersecurity
+oauth,technical,
+jwt,technical,
+api design,technical,
+documentation,technical,
+communication,soft,
+teamwork,soft,collaboration
+problem solving,soft,
+leadership,soft,
+project management,soft,
+attention to detail,soft,
+mentoring,soft,
