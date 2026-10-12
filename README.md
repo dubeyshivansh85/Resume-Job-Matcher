@@ -1,188 +1,132 @@
-# Resume ↔ Job Matching NLP Tool (v2)
+# Resume ↔ Job Matching & ATS Analytics NLP Engine
 
-[![Streamlit App](https://img.shields.io/badge/Streamlit%20App-Live%20Demo-brightgreen?style=for-the-badge&logo=streamlit)](https://resume-job-matcher-fa4gw7ehcqwqwiqhfdwrcp.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue?style=for-the-badge&logo=python)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-25%20Passed-success?style=for-the-badge&logo=pytest)](https://docs.pytest.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-App%20Interface-FF4B4B?style=for-the-badge&logo=streamlit)](https://resume-job-matcher-fa4gw7ehcqwqwiqhfdwrcp.streamlit.app/)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Online-brightgreen?style=for-the-badge)](https://resume-job-matcher-fa4gw7ehcqwqwiqhfdwrcp.streamlit.app/)
+[![Jupyter](https://img.shields.io/badge/Jupyter-Interactive%20Notebook-F37626?style=for-the-badge&logo=jupyter)](https://jupyter.org/)
 [![License](https://img.shields.io/badge/License-MIT-purple?style=for-the-badge)](LICENSE)
 
-An end-to-end NLP tool that scores resume-to-job fit using a **hybrid keyword + semantic similarity pipeline**, provides prioritized skill gap analysis, generates **AI resume bullet rewrites** (via Google Gemini), calculates an ATS compatibility score, detects seniority mismatches, and benchmarks applicants against real industry distributions.
+An industrial-grade NLP pipeline that evaluates candidate resume-to-job fit using a **hybrid lexical overlap + dense semantic embedding architecture**. It performs automated ATS compatibility diagnostics, identifies seniority/experience level misalignments, estimates candidate benchmark percentiles, and generates copy-paste-ready resume bullet rewrites via **Google Gemini**.
 
 ---
 
-## 🚀 Key Features (v2)
+## 🌐 Live Demo
 
-| Feature | Description |
-|---|---|
-| **Hybrid Matching Engine** | Combines **Jaccard similarity** (extracted skill tokens) and **Dense Semantic Embeddings** (`all-MiniLM-L6-v2` / `all-mpnet-base-v2` via Cosine Similarity) with configurable weighting. |
-| **Modular 6-Step Pipeline** | Clean, production-ready codebase split into numbered interview-friendly modules (`src/step1_...` through `src/step6_...`). |
-| **AI Resume Bullet Rewrites** | Powered by **Google Gemini API** (`gemini-2.0-flash`) — crafts tailored STAR-method bullet points incorporating missing skills. Seamless offline fallback if no API key is provided. |
-| **Multi-Job Comparison** | Rank and compare up to 5 job postings simultaneously to find the best match. |
-| **Seniority Level Check** | Detects mismatched career levels (e.g., Junior applying to Staff/Principal roles) using regex heuristics. |
-| **ATS Compatibility Check** | Analyzes contact info, section headers, quantifiable bullet points, keyword coverage, and length. |
-| **Interactive Score Simulator** | Live resume editor with instant score delta calculation as you edit your resume. |
-| **Job URL Extraction** | Paste a job posting URL to scrape text automatically via Jina AI reader. |
-| **Multi-Format Ingestion** | Supports **PDF** (`pdfplumber`), **DOCX** (`python-docx`), and plain text input. |
-| **Unit Test Suite** | 25 automated unit tests covering extraction, matching, ATS scoring, and fallback generators. |
+Experience the live deployed web application:
+👉 **[Open Live App on Streamlit Cloud](https://resume-job-matcher-fa4gw7ehcqwqwiqhfdwrcp.streamlit.app/)**
 
 ---
 
-## 🧠 How the Matching Engine Works
+## ⚡ Architecture & Key Capabilities
 
-```
-Resume Text ───────┬──► [step1_utils] Clean & Normalize ──► [step2_extractor] spaCy PhraseMatcher ──┐
-                   │                                                                               │
-Job Description ───┴──► [step1_utils] Clean & Normalize ──► [step2_extractor] spaCy PhraseMatcher ──┤
-                                                                                                   ▼
-                                                                                   Skill Sets (Jaccard: 40%)
-                                                                                                   │
-Resume Text ───────┬──► [step3_matching] Sentence-BERT Embeddings ─────────────────────────────────┤
-Job Description ───┴──► [step3_matching] Cosine Similarity ────────────────────────► (Semantic: 60%)
-                                                                                                   │
-                                                                                                   ▼
-                                                                                    Overall Match Score (0-100%)
-                                                                                                   │
-                                                ┌──────────────────────────────────────────────────┴──────────────────────┐
-                                                ▼                                                                         ▼
-                                   [step4_suggestions] Priority Ranker                                     [step3_matching] ATS Engine
-                                                │                                                                         │
-                                                ▼                                                                         ▼
-                                   Gemini AI STAR Bullet Rewrites                                          ATS Score & Seniority Audit
-```
-
-1. **Skill Extraction (`src/step2_extractor.py`)**: Uses spaCy's `PhraseMatcher` over a curated taxonomy (~150 Data/ML skills + ~70 Software Engineering skills with synonym mappings). This is deterministic and significantly faster than heavy NER models.
-2. **Keyword Match (Jaccard)**: Measures the exact overlap ratio:
-   $$\text{Jaccard} = \frac{|S_{\text{resume}} \cap S_{\text{job}}|}{|S_{\text{resume}} \cup S_{\text{job}}|}$$
-3. **Semantic Match (Sentence-BERT)**: Encodes full resume and job texts into dense 384-dimensional vectors using `all-MiniLM-L6-v2` and calculates cosine similarity. This captures implied skills (e.g., "built ETL pipelines with airflow" matches "data engineering infrastructure").
-4. **Final Weighted Score**:
-   $$\text{Final Score} = (0.40 \times \text{Jaccard}) + (0.60 \times \text{Semantic})$$
-5. **Priority Ranking (`src/step4_suggestions.py`)**: Ranks missing skills by frequency in the posting, whether they appear in the job title (3x weight multiplier), and section placement.
-6. **ATS Audit**: Evaluates email, phone, LinkedIn/GitHub links, standard headings (Experience, Education, Skills), quantifiable metrics (`%`, `$`, numbers), and word count heuristics.
+- **Hybrid Scoring Engine:** Balances hard skill keyword presence (spaCy PhraseMatcher with curated DS/ML and SWE taxonomies) and deep contextual understanding (Sentence-BERT `all-MiniLM-L6-v2` dense vectors):
+  $$\text{Final Score} = \alpha \cdot \text{Jaccard}(S_{\text{resume}}, S_{\text{job}}) + (1 - \alpha) \cdot \text{Cosine}(E_{\text{resume}}, E_{\text{job}})$$
+- **ATS Compatibility Diagnostic:** Audits contact information (email, phone), structural headings (Experience, Education, Skills, Projects), target keyword coverage, document length (200–1200 words), and quantifiable metrics (`%`, `$`, numbers).
+- **Seniority & Experience Guardrails:** Detects career level mismatches (e.g. junior profiles targeting Lead/Principal roles, or vice versa).
+- **Contextual Skill Prioritization:** Ranks missing competencies by prominence in the job title (+5), opening summary (+3), and document frequency (+2/mention).
+- **Generative AI Bullet Rewrites:** Uses Google Gemini (`gemini-3.8-flash`) to generate quantifiable, STAR-method bullet points tailored to missing skills (with automated fallback to heuristic templates).
+- **Interactive Visualizations:** High-fidelity Plotly match score speedometer gauges, skill coverage donut charts, and multi-job comparison bar charts.
+- **Multi-Format Ingestion:** Supports plain text, selectable PDFs (`pdfplumber`), and Word documents (`python-docx`).
 
 ---
 
-## 📁 Project Structure
+## 📁 Clean, Minimal Project Structure
 
-Organized into sequential numbered steps for clear understanding and interview presentation:
+Designed with a consolidated, zero-bloat file structure:
 
 ```
 Resume-Job-Matcher/
-├── app.py                      # Streamlit web application & UI layout
-├── Blueprint.md                # Architectural design document & interview guide
-├── requirements.txt            # Python dependencies
-├── runtime.txt                 # Target runtime (Python 3.11 for Streamlit Cloud)
-├── .env.example                # Template for environment variables (API keys)
-├── .gitignore                  # Git ignore rules (protects .env, __pycache__, datasets)
-├── README.md                   # Project documentation
-│
-├── src/                        # Core modular engine (numbered by execution step)
-│   ├── __init__.py
-│   ├── step1_utils.py          # Step 1: Text preprocessing, cleaning, PDF/DOCX parsing
-│   ├── step2_extractor.py      # Step 2: spaCy PhraseMatcher & taxonomy loader
-│   ├── step3_matching.py       # Step 3: Hybrid matching, ATS scoring, seniority audit
-│   ├── step4_suggestions.py    # Step 4: Missing skill ranking & Gemini AI bullet rewrites
-│   ├── step5_charts.py         # Step 5: Plotly gauge, donut, and comparison visualizations
-│   └── step6_scraper.py        # Step 6: Web scraping for job postings via Jina AI
-│
-├── data/
-│   ├── skills_taxonomy.csv     # Curated Data Science & ML skills taxonomy
-│   ├── taxonomy_software.csv   # Software Engineering skills taxonomy
-│   ├── ds_postings_filtered.csv
-│   ├── ds_postings_with_skills.csv
-│   ├── ds_resumes_with_skills.csv
-│   ├── posting_embeddings.npy  # Precomputed embeddings for instant benchmarking
-│   └── resume_embeddings.npy
-│
-└── tests/
-    ├── conftest.py             # Shared pytest fixtures & test data
-    └── test_matching.py        # 25 automated unit tests
+├── resume_job_matcher.ipynb  # Master Jupyter Notebook: End-to-end data science, NLP pipeline & self-checks
+├── app.py                    # Standalone Streamlit Web Application (Full GUI, Live Editor, Multi-Job Comparison)
+├── requirements.txt          # Python dependencies
+├── .env.example              # Environment template for Google Gemini API key
+├── .gitignore                # Git ignore configuration
+└── README.md                 # Project documentation
 ```
 
 ---
 
-## 🛠️ Tech Stack
+## 🚀 Quickstart Guide
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| **App & UI** | Streamlit, Plotly | Interactive responsive web application & visual analytics |
-| **NLP & Matching** | spaCy (`en_core_web_sm`), `PhraseMatcher` | Fast, deterministic rule-based skill extraction |
-| **Vector Embeddings** | `sentence-transformers` (`all-MiniLM-L6-v2`) | Dense semantic text representations |
-| **Similarity Metrics** | `scikit-learn` (Cosine Similarity) | Vector distance computation |
-| **Generative AI** | Google Gemini API (`gemini-2.0-flash`) | Contextual resume bullet point rewriting (STAR method) |
-| **Document Parsers** | `pdfplumber`, `python-docx` | Extraction from PDF and Word documents |
-| **Web Ingestion** | Jina AI Reader API | Clean markdown extraction from public job URLs |
-| **Testing** | `pytest` | 25 automated unit tests for core logic |
+### 1. Installation
 
----
+Clone the repository and install the dependencies:
 
-## ⚡ Quickstart & Setup
-
-### 1. Clone the Repository
 ```bash
 git clone https://github.com/dubeyshivansh85/Resume-Job-Matcher.git
 cd Resume-Job-Matcher
-```
-
-### 2. Create and Activate a Virtual Environment
-```bash
-# Windows
-python -m venv venv
-venv\Scripts\activate
-
-# macOS / Linux
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
-```bash
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
 ```
 
-### 4. (Optional) Configure Google Gemini API Key
-To enable AI-powered resume bullet rewrites:
+### 2. Configure Environment (Optional for AI Rewriting)
+
+Copy `.env.example` to `.env` and add your free Google Gemini API key:
+
 ```bash
 cp .env.example .env
 ```
-Open `.env` and add your free Gemini API key:
-```ini
+
+Inside `.env`:
+```env
 GEMINI_API_KEY=your_gemini_api_key_here
 ```
-> *Note: If no API key is set, the app gracefully falls back to template-based suggestions automatically.*
+*(If no API key is provided, the tool automatically uses rule-based heuristic templates for resume recommendations.)*
 
-### 5. Run the Streamlit App
+---
+
+## 💻 Running the Project
+
+### Option A: Interactive Jupyter Notebook (`resume_job_matcher.ipynb`)
+
+Open the notebook in Jupyter Lab, VS Code, Google Colab, or Kaggle:
+
+```bash
+jupyter lab resume_job_matcher.ipynb
+```
+
+The notebook contains:
+1. Mathematical formulation & architecture overview
+2. Text cleaning & normalization utilities
+3. Embedded domain skill taxonomies (Data Science / ML / AI and Software Engineering)
+4. spaCy token-level PhraseMatcher skill extractor
+5. Sentence-Transformers dense embedding engine
+6. Hybrid match scoring ($\alpha \cdot \text{Jaccard} + (1-\alpha) \cdot \text{Cosine}$)
+7. ATS heuristic audit & seniority alignment checks
+8. Contextual skill prioritization & Gemini bullet generation
+9. Interactive Plotly charts
+10. Live demonstrations on realistic candidate profiles
+11. Inline 12-point unit assertion test suite (`run_self_checks()`)
+
+### Option B: Interactive Streamlit Web App (`app.py`)
+
+Launch the web app locally:
+
 ```bash
 streamlit run app.py
 ```
-Open your browser at `http://localhost:8501`.
+
+Features included in the web app:
+- **Load Resume:** Upload PDF/DOCX or select from preloaded curated candidate profiles.
+- **Single Job Analysis:** Paste job text or provide a public URL to view the match score, ATS breakdown, matched/missing skills, and AI rewrites.
+- **Multi-Job Comparison:** Add up to 5 target positions and view a ranked comparison table and grouped bar chart.
+- **Live Resume Editor:** Edit your resume in real time and see the match score delta update instantly.
 
 ---
 
-## 🧪 Running Tests
+## 🧪 Self-Validation & Testing
 
-The test suite validates text extraction, skill normalization, Jaccard similarity, semantic similarity, ATS scoring, and suggestion generation:
+The pipeline includes built-in verification assertions testing:
+- Text cleaning (camelCase splits, HTML removal, punctuation preservation)
+- Jaccard set operations (identical, disjoint, and partial overlaps)
+- Dense embedding similarity bounds
+- ATS criteria checklist calculation
+- Seniority mismatch trigger rules
+- Benchmark percentile mappings
 
-```bash
-pytest tests/ -v
-```
-
-Expected output:
-```
-tests/test_matching.py .........................                         [100%]
-============================== 25 passed in ~2.5s ==============================
-```
+Run the notebook's test cell or execute directly in Python to verify all assertions pass with zero failures.
 
 ---
 
-## 💼 Interview Talking Points
+## 📜 License
 
-- **Why Hybrid (Keyword + Semantic)?** Keyword-only matching fails when candidates use synonyms or describe achievements without exact buzzwords. Pure vector search can hallucinate relevance on fluff text. Combining deterministic `PhraseMatcher` (40%) with dense embeddings (60%) provides both precision and contextual recall.
-- **Why spaCy PhraseMatcher over NER?** Pre-trained NER models often miss niche tech acronyms (e.g., `dbt`, `PyTorch`, `CI/CD`) and have high inference latency. `PhraseMatcher` runs in sub-millisecond time with zero false positives for known taxonomy terms.
-- **Production Architecture**: Logic is separated cleanly from Streamlit UI into `src/`. This decouples the presentation layer from the NLP engine, making the pipeline easy to unit test and containerize for REST/FastAPI deployment.
-- **Graceful Degradation**: If external API calls (Gemini, Jina AI) fail or are unconfigured, the app falls back to rule-based algorithms with zero user interruption.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License. Free for academic, personal, and commercial use.

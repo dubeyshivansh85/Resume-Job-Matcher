@@ -1,783 +1,580 @@
 """
-app.py
-Resume ↔ Job Matching Tool — Streamlit App (v2)
-
+app.py - Resume <-> Job Matching & ATS Analytics
+Concise, self-contained Streamlit application.
 Run with: streamlit run app.py
 """
 
-# Load .env for local development (ignored on Streamlit Cloud)
 from dotenv import load_dotenv
 load_dotenv()
 
-import ast
-import json
-import os
-import sys
-
+import io, os, re, json, warnings
+from typing import Optional, Tuple, Dict, List, Set, Any
+import numpy as np
 import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+import spacy
+from spacy.matcher import PhraseMatcher
+from sentence_transformers import SentenceTransformer
+import plotly.graph_objects as go
+import requests
 import streamlit as st
 
-# Make src/ importable
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from src.step1_utils import clean_text, extract_resume_text, segment_concatenated_skills
-from src.step2_extractor import SkillExtractor, get_available_industries, TAXONOMY_FILES
-from src.step3_matching import compute_match, compute_ats_score, detect_seniority_mismatch, get_benchmark_percentile
-from src.step4_suggestions import rank_missing_skills, generate_template_suggestions, generate_ai_suggestions
-from src.step5_charts import build_donut_chart, build_score_gauge, build_comparison_bar_chart
-from src.step6_scraper import fetch_job_from_url
+warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
-# Paths
+# Compact Taxonomy Knowledge Base
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_RESUMES_PATH = os.path.join(BASE_DIR, "data", "ds_resumes_with_skills.csv")
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Resume ↔ Job Matcher",
-    page_icon="🧩",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ---------------------------------------------------------------------------
-# Custom CSS
-# ---------------------------------------------------------------------------
-st.markdown("""
-<style>
-    /* Main background */
-    .stApp { background-color: #0f1117; }
-
-    /* Card-like containers */
-    div[data-testid="stExpander"] { border: 1px solid #1f2937; border-radius: 8px; }
-
-    /* Metric cards */
-    div[data-testid="metric-container"] {
-        background: #1a1d2e;
-        border: 1px solid #2d3748;
-        border-radius: 12px;
-        padding: 16px;
+TAXONOMY_CONFIG = {
+    "data_science": {
+        "technical": (
+            "python,sql,r,java,scala,c++,javascript,machine learning,deep learning,"
+            "natural language processing,computer vision,data visualization,data analysis,"
+            "data engineering,data modeling,statistics,a/b testing,hypothesis testing,"
+            "regression,classification,clustering,neural networks,etl,ci/cd,linux,bash,"
+            "rest api,graphql,nosql,data warehousing,big data,distributed systems,"
+            "time series analysis,recommendation systems,llm,generative ai,prompt engineering,"
+            "mlops,model deployment,feature engineering,data cleaning,data pipeline,"
+            "spreadsheet modeling,financial modeling,business intelligence,kpi tracking,"
+            "dashboarding,agile,c#,c,node.js,react,html,css,data governance,data quality,"
+            "data privacy,gdpr,model monitoring,a/b test design,experimentation,"
+            "causal inference,bayesian statistics,optimization,linear programming,"
+            "supply chain analytics,fraud detection,anomaly detection,churn prediction,"
+            "customer segmentation,market basket analysis,sentiment analysis,topic modeling,"
+            "transformers,bert,gpt,image processing,speech recognition,reinforcement learning,"
+            "random forest,gradient boosting"
+        ),
+        "tool": (
+            "excel,tableau,power bi,looker,tensorflow,pytorch,keras,scikit-learn,pandas,"
+            "numpy,matplotlib,seaborn,spark,hadoop,kafka,airflow,dbt,snowflake,redshift,"
+            "bigquery,aws,azure,gcp,docker,kubernetes,git,github,mongodb,postgresql,mysql,"
+            "huggingface,langchain,matlab,sas,spss,apache flink,apache beam,terraform,"
+            "jenkins,jira,confluence,salesforce,looker studio,d3.js,flask,django,fastapi,"
+            "opencv,xgboost,lightgbm"
+        ),
+        "soft": (
+            "communication,teamwork,problem solving,leadership,project management,"
+            "stakeholder management,critical thinking,attention to detail,presentation skills,mentoring"
+        ),
+        "synonyms": {
+            "sql": ["structured query language"], "c++": ["cpp"], "javascript": ["js"], "excel": ["microsoft excel"],
+            "power bi": ["powerbi"], "machine learning": ["ml"], "deep learning": ["dl"], "natural language processing": ["nlp"],
+            "computer vision": ["cv"], "statistics": ["statistical analysis"], "a/b testing": ["ab testing"], "scikit-learn": ["sklearn"],
+            "spark": ["apache spark"], "kafka": ["apache kafka"], "airflow": ["apache airflow"], "etl": ["extract transform load"],
+            "redshift": ["amazon redshift"], "bigquery": ["google bigquery"], "nosql": ["non relational database"],
+            "llm": ["large language model", "llms"], "generative ai": ["genai", "gen ai"], "ci/cd": ["cicd", "continuous integration"],
+            "mlops": ["machine learning operations"], "time series analysis": ["time series"],
+            "neural networks": ["ann", "artificial neural networks"], "pytorch": ["torch"], "aws": ["amazon web services"],
+            "gcp": ["google cloud platform"], "docker": ["containerization"], "kubernetes": ["k8s"], "mongodb": ["mongo"],
+            "postgresql": ["postgres"], "a/b test design": ["ab test design"], "transformers": ["transformer models"],
+            "bert": ["bidirectional encoder representations"], "gpt": ["generative pre-trained transformer"],
+            "random forest": ["rf"], "gradient boosting": ["gbm", "gbdt"], "xgboost": ["xgb"]
+        }
+    },
+    "software_engineering": {
+        "technical": (
+            "python,java,javascript,typescript,c++,c#,go,rust,ruby,kotlin,swift,php,html,css,"
+            "sql,nosql,rest api,graphql,grpc,microservices,distributed systems,system design,"
+            "data structures,algorithms,object-oriented programming,functional programming,"
+            "database design,event-driven architecture,concurrency,multithreading,ci/cd,linux,"
+            "bash,networking,security,oauth,jwt,test-driven development,unit testing,"
+            "integration testing,e2e testing,code review,design patterns,serverless,"
+            "web development,backend development,frontend development,full stack development,"
+            "cloud computing,agile,scrum,devops"
+        ),
+        "tool": (
+            "docker,kubernetes,terraform,ansible,jenkins,github actions,git,github,gitlab,"
+            "aws,gcp,azure,react,vue,angular,next.js,node.js,express,fastapi,django,flask"
+        ),
+        "soft": (
+            "communication,teamwork,problem solving,leadership,project management,"
+            "attention to detail,mentoring"
+        ),
+        "synonyms": {
+            "javascript": ["js"], "typescript": ["ts"], "c++": ["cpp"], "c#": ["csharp"], "go": ["golang"],
+            "html": ["html5"], "css": ["css3"], "rest api": ["restful api", "rest"], "microservices": ["microservice architecture"],
+            "system design": ["systems design"], "object-oriented programming": ["oop"], "ci/cd": ["cicd", "continuous integration"],
+            "test-driven development": ["tdd"], "aws": ["amazon web services"], "gcp": ["google cloud"],
+            "docker": ["containers"], "kubernetes": ["k8s"], "github actions": ["gha"], "node.js": ["nodejs", "node"],
+            "react": ["reactjs", "react.js"], "vue": ["vuejs", "vue.js"], "angular": ["angularjs"], "next.js": ["nextjs"],
+            "fastapi": ["fast api"], "full stack development": ["fullstack"], "cloud computing": ["cloud"]
+        }
     }
+}
 
-    /* Priority tags */
-    .tag-high   { background:#7f1d1d; color:#fca5a5; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
-    .tag-medium { background:#78350f; color:#fcd34d; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
-    .tag-low    { background:#1f2937; color:#9ca3af; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:600; }
+def load_taxonomy_records(industry_key: str = "data_science") -> List[Dict[str, Any]]:
+    cfg = TAXONOMY_CONFIG.get(industry_key, TAXONOMY_CONFIG["data_science"])
+    syn_map = cfg.get("synonyms", {})
+    records = []
+    for cat in ["technical", "tool", "soft"]:
+        for name in cfg[cat].split(","):
+            name = name.strip()
+            if name:
+                records.append({"skill_name": name, "category": cat, "synonyms": syn_map.get(name, [])})
+    return records
 
-    /* AI badge */
-    .badge-ai   { background:#3730a3; color:#a5b4fc; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; }
-    .badge-tmpl { background:#1f2937; color:#6b7280; padding:2px 8px; border-radius:12px; font-size:11px; }
+TAXONOMY_OPTIONS = {"Data Science / ML / AI": "data_science", "Software Engineering": "software_engineering"}
 
-    /* Skill chips */
-    code { background:#1e293b !important; color:#7dd3fc !important; border-radius:6px !important; }
+SAMPLE_RESUME = """Alex Chen
+Email: alex.chen@example.com | Phone: +1 (555) 382-9912 | San Francisco, CA
+GitHub: github.com/alexchen-ml | LinkedIn: linkedin.com/in/alexchen-ai
 
-    /* Divider */
-    hr { border-color: #1f2937 !important; }
-</style>
-""", unsafe_allow_html=True)
+PROFESSIONAL SUMMARY
+Data Scientist with 3+ years experience building predictive machine learning models, statistical inference pipelines, and scalable predictive systems. Proven track record of leveraging Python, SQL, and deep learning frameworks to drive business outcomes.
 
+TECHNICAL SKILLS
+Languages: Python, SQL, R, Bash
+Machine Learning: PyTorch, TensorFlow, Scikit-Learn, XGBoost, Regression, Classification, Clustering
+Data & Cloud: Pandas, NumPy, Spark, AWS, Docker, PostgreSQL, CI/CD, A/B Testing
+
+EXPERIENCE
+Data Scientist | Nexa Analytics | 2022 - Present
+- Deployed customer churn prediction model in PyTorch and XGBoost, reducing churn by 18% ($1.2M annual savings).
+- Built automated feature engineering pipeline in SQL and Spark processing 50M+ daily events.
+- Executed 40+ production algorithm experiments using rigorous hypothesis testing and statistical analysis.
+
+Junior ML Engineer | DataCore Solutions | 2020 - 2022
+- Developed NLP sentiment classification models using HuggingFace and PyTorch with 92% F1 score.
+- Packaged Scikit-Learn pipelines into Docker containers deployed on AWS.
+
+EDUCATION
+B.S. in Computer Science | UC Berkeley | 2020"""
+
+SAMPLE_JOBS = {
+    "Senior Machine Learning Engineer (Apex AI)": """Job Title: Senior Machine Learning Engineer
+Company: Apex AI
+Location: Remote
+Seeking a Senior ML Engineer to architect, build, and deploy production machine learning and deep learning systems.
+Requirements:
+- 5+ years experience in Python, SQL, PyTorch, TensorFlow, and Scikit-Learn.
+- Experience with MLOps, Docker, Kubernetes, Spark, and CI/CD pipelines.
+- Strong background in deep learning, regression, classification, clustering, neural networks, and NLP.
+- Demonstrated technical leadership and mentoring.""",
+    "Lead Data Analyst & BI (Metro Financial)": """Job Title: Lead Data Analyst
+Company: Metro Financial
+Location: New York, NY
+Looking for a Lead Data Analyst to transform complex financial data into executive intelligence models.
+Requirements:
+- 4+ years experience with SQL, Tableau, Power BI, Excel, and statistical modeling.
+- Experience with Python or R for data analysis, A/B testing, and hypothesis testing.
+- Strong communication, data modeling, business intelligence, and stakeholder management.""",
+    "Full Stack Software Engineer (CloudVenture)": """Job Title: Full Stack Software Engineer
+Company: CloudVenture
+Location: Remote
+Seeking a Full Stack Engineer to build responsive web applications and cloud microservices.
+Requirements:
+- 3+ years experience with TypeScript, JavaScript, React, Next.js, and Node.js.
+- Strong knowledge of REST APIs, GraphQL, Docker, PostgreSQL, AWS, and Git.
+- Experience with CI/CD, microservices architecture, and agile software development."""
+}
 
 # ---------------------------------------------------------------------------
-# Sidebar — settings
+# NLP & Matching Engine
 # ---------------------------------------------------------------------------
+def clean_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"&\w+;|<[^>]+>", " ", text).lower()
+    text = re.sub(r"[^a-z0-9\s\+\#\.\-\/]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def extract_resume_text(uploaded_file) -> Tuple[str, Optional[str]]:
+    if isinstance(uploaded_file, str):
+        return uploaded_file.strip(), None
+    fname = getattr(uploaded_file, "name", "").lower()
+    if fname.endswith(".pdf"):
+        try:
+            import pdfplumber
+            with pdfplumber.open(uploaded_file) as pdf:
+                txt = "\n".join(p.extract_text() for p in pdf.pages if p.extract_text())
+            return txt.strip(), None if txt.strip() else ("Warning: No selectable text in PDF.",)
+        except Exception as e:
+            return "", f"Failed to read PDF: {e}"
+    if fname.endswith(".docx"):
+        try:
+            from docx import Document
+            doc = Document(io.BytesIO(uploaded_file.read()))
+            txt = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return txt.strip(), None if txt.strip() else ("Warning: Empty DOCX file.",)
+        except Exception as e:
+            return "", f"Failed to read DOCX: {e}"
+    return uploaded_file.read().decode("utf-8", errors="ignore").strip(), None
+
+class SkillExtractor:
+    def __init__(self, industry_key: str = "data_science"):
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            self.nlp = spacy.blank("en")
+        self.matcher = PhraseMatcher(self.nlp.vocab, attr="LOWER")
+        self.records = load_taxonomy_records(industry_key)
+        self.surface_to_canonical = {}
+        self.skill_categories = {}
+        for r in self.records:
+            c, cat = r["skill_name"], r["category"]
+            self.skill_categories[c] = cat
+            for s in [c] + r["synonyms"]:
+                self.surface_to_canonical[s] = c
+        self.matcher.add("SKILL", [self.nlp.make_doc(s) for s in self.surface_to_canonical])
+
+    def extract(self, text: str) -> Set[str]:
+        if not text or not isinstance(text, str):
+            return set()
+        doc = self.nlp(text)
+        return {self.surface_to_canonical.get(doc[start:end].text.lower(), doc[start:end].text.lower()) for _, start, end in self.matcher(doc)}
+
+def segment_skills(text: str, ext: SkillExtractor) -> str:
+    for form in sorted(ext.surface_to_canonical, key=len, reverse=True):
+        if len(form) >= 3:
+            text = re.sub(re.escape(form), f" {form} ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def group_skills(s_list: Any, ext: SkillExtractor) -> Dict[str, List[str]]:
+    g = {"technical": [], "tool": [], "soft": []}
+    for s in s_list:
+        cat = ext.skill_categories.get(s, "technical")
+        g[cat if cat in g else "technical"].append(s)
+    return g
+
+def jaccard(s_a: Set[str], s_b: Set[str]) -> float:
+    return float(len(s_a & s_b) / len(s_a | s_b)) if s_a | s_b else 0.0
+
+def compute_match(r_clean, r_skills, r_emb, j_clean, j_skills, j_emb, kw_weight=0.4):
+    jac = jaccard(r_skills, j_skills)
+    cos = float(cosine_similarity(r_emb.reshape(1, -1), j_emb.reshape(1, -1))[0][0])
+    final = kw_weight * jac + (1.0 - kw_weight) * cos
+    return {"jaccard": round(jac, 4), "semantic": round(cos, 4), "final_score": round(final, 4),
+            "matched_skills": sorted(r_skills & j_skills), "missing_skills": sorted(j_skills - r_skills)}
+
+def compute_ats_score(r_raw, r_clean, j_skills, r_skills):
+    checks = []
+    has_email = bool(re.search(r"[\w\.-]+@[\w\.-]+\.\w+", r_raw))
+    checks.append(("Contact email address detected", has_email, 15))
+    has_phone = bool(re.search(r"\b\+?[\d\-\s\(\)]{7,}\d\b", r_raw))
+    checks.append(("Phone number detected", has_phone, 10))
+    sec_count = sum(1 for kw in ["experience", "education", "skills", "project"] if kw in r_clean)
+    checks.append((f"Standard sections found ({sec_count}/4)", sec_count >= 3, int(sec_count * 5)))
+    cov = len(r_skills & j_skills) / len(j_skills) if j_skills else 0.0
+    checks.append((f"Job keyword coverage ({int(cov*100)}%)", cov >= 0.4, int(cov * 25)))
+    wc = len(r_clean.split())
+    checks.append((f"Word count optimal ({wc} words)", 200 <= wc <= 1200, 10 if 200 <= wc <= 1200 else 0))
+    metrics = bool(re.search(r"\d+%|\$\d+|\b\d{2,}\b", r_raw))
+    checks.append(("Quantifiable impact metrics (%, $, numbers)", metrics, 10 if metrics else 0))
+    action_verbs = any(re.search(rf"\b{v}\b", r_clean) for v in ["led", "developed", "architected", "engineered", "built", "deployed", "optimized", "designed", "analyzed", "automated"])
+    checks.append(("Impact action verbs detected (architected, deployed, etc.)", action_verbs, 10 if action_verbs else 0))
+    score = min(sum(pts for _, ok, pts in checks if ok), 100)
+    return {"score": score, "checks": [(lbl, ok) for lbl, ok, _ in checks]}
+
+SENIOR_SIGNALS = ["senior", "lead", "principal", "staff", "head of", "director", "manager", "5+ years", "7+ years", "10+ years"]
+JUNIOR_SIGNALS = ["junior", "entry level", "entry-level", "associate", "0-2 years", "graduate", "intern"]
+
+def detect_seniority(r_clean, j_clean, title):
+    jd = (j_clean + " " + (title or "")).lower()
+    if any(s in jd for s in SENIOR_SIGNALS) and not any(s in r_clean for s in SENIOR_SIGNALS):
+        return {"type": "underqualified", "message": "⚠️ Seniority Notice: Role expects Senior/Lead signals; consider emphasizing leadership."}
+    if any(s in jd for s in JUNIOR_SIGNALS) and any(s in r_clean for s in SENIOR_SIGNALS):
+        return {"type": "overqualified", "message": "ℹ️ Note: Position is junior/entry level, but resume emphasizes senior leadership."}
+    return None
+
+BENCHMARK_TABLE = [(0.8, 99), (0.75, 95), (0.7, 90), (0.65, 82), (0.6, 72), (0.55, 60), (0.5, 48), (0.4, 25), (0.3, 8), (0.0, 1)]
+def get_benchmark(score):
+    return next((pct for th, pct in BENCHMARK_TABLE if score >= th), 1)
+
+def rank_missing(missing, title, j_clean, ext):
+    t_clean = (title or "").lower()
+    scored = []
+    for skill in missing:
+        forms = [f for f, c in ext.surface_to_canonical.items() if c == skill] or [skill]
+        score = sum(5 if f in t_clean else 0 for f in forms) + sum(j_clean.count(f) * 2 for f in forms)
+        tier = "High" if score >= 6 else ("Medium" if score >= 2 else "Low")
+        scored.append((skill, tier, score))
+    return sorted(scored, key=lambda x: x[2], reverse=True)
+
+SUGG_TEMPLATES = {
+    "technical": "Add a project accomplishment where you utilized **{skill}** with measurable outcomes (e.g., 'Implemented {skill} to improve throughput by 25%').",
+    "tool": "Explicitly feature **{skill}** in your core skills and tools section for automated keyword indexing.",
+    "soft": "Illustrate **{skill}** through cross-functional team leadership or measurable project delivery.",
+}
+
+def generate_suggestions(ranked_missing, j_raw, r_raw, ext, api_key=None, top_n=5):
+    key = api_key or os.getenv("GEMINI_API_KEY")
+    if key and key.strip() != "your_gemini_api_key_here":
+        try:
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=key)
+            skills_str = ", ".join(s for s, _, _ in ranked_missing[:top_n])
+            prompt = f"Resume writer task: For each missing skill [{skills_str}], write ONE concise, quantified resume bullet point. JD: {j_raw[:1000]}. Resume: {r_raw[:1000]}. Numbered list only."
+            res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt, config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=600))
+            lines = [re.sub(r"^\d+[\.\)]\s*", "", l).strip() for l in res.text.strip().split("\n") if l.strip()]
+            return [{"skill": s, "priority": t, "suggestion": lines[i] if i < len(lines) else SUGG_TEMPLATES[ext.skill_categories.get(s, "technical")].format(skill=s), "ai": i < len(lines)}
+                    for i, (s, t, _) in enumerate(ranked_missing[:top_n])]
+        except Exception:
+            pass
+    return [{"skill": s, "priority": t, "suggestion": SUGG_TEMPLATES[ext.skill_categories.get(s, "technical")].format(skill=s), "ai": False} for s, t, _ in ranked_missing[:top_n]]
+
+
+def fetch_url(url: str):
+    if not url.strip():
+        return "", "Invalid URL."
+    url = "https://" + url.strip() if not url.strip().startswith(("http://", "https://")) else url.strip()
+    if any(d in url for d in ["linkedin.com", "lnkd.in"]):
+        return "", "LinkedIn blocks automated scraping. Please paste text directly."
+    try:
+        r = requests.get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"}, timeout=15)
+        txt = re.sub(r"!\[.*?\]\(.*?\)|\[([^\]]+)\]\([^)]+\)", r"\2", r.text.strip())
+        return (txt, None) if len(txt) >= 100 else ("", "Page content too short.")
+    except Exception as e:
+        return "", str(e)
+
+# ---------------------------------------------------------------------------
+# Visualizations
+# ---------------------------------------------------------------------------
+def plot_donut(matched: int, missing: int) -> go.Figure:
+    tot = matched + missing
+    pct = int((matched / tot) * 100) if tot else 0
+    fig = go.Figure(go.Pie(labels=["Matched", "Missing"], values=[matched, missing], hole=0.68,
+                           marker=dict(colors=["#22c55e", "#ef4444"], line=dict(color="#0f172a", width=2)),
+                           textinfo="label+value", hoverinfo="label+percent"))
+    fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=240, paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
+                      annotations=[dict(text=f"<b>{pct}%</b><br><span style='font-size:11px;color:#94a3b8'>Coverage</span>", x=0.5, y=0.5, font=dict(size=20, color="white"), showarrow=False)])
+    return fig
+
+def plot_bar(results: List[Dict[str, Any]]) -> go.Figure:
+    labels = [r["label"] for r in results]
+    fig = go.Figure([
+        go.Bar(name="Overall Match", y=labels, x=[int(r["final_score"]*100) for r in results], orientation="h", marker_color="#6366f1", text=[f"{int(r['final_score']*100)}%" for r in results], textposition="outside"),
+        go.Bar(name="Keywords", y=labels, x=[int(r["jaccard"]*100) for r in results], orientation="h", marker_color="#22c55e"),
+        go.Bar(name="Semantic", y=labels, x=[int(r["semantic"]*100) for r in results], orientation="h", marker_color="#f59e0b"),
+    ])
+    fig.update_layout(barmode="group", height=max(250, len(labels)*60+80), margin=dict(t=20, b=20, l=10, r=60), paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
+                      font=dict(color="white"), xaxis=dict(range=[0, 115], showgrid=False, ticksuffix="%", color="#94a3b8"), yaxis=dict(color="#cbd5e1"))
+    return fig
+
+# ---------------------------------------------------------------------------
+# Streamlit Application Interface
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Resume ↔ Job Matcher", page_icon="🧩", layout="wide")
+st.markdown("<style>.stApp { background:#0f1117; } div[data-testid='metric-container'] { background:#1a1d2e; border:1px solid #2d3748; border-radius:12px; padding:16px; } .tag-high { background:#7f1d1d; color:#fca5a5; padding:2px 8px; border-radius:8px; font-size:12px; font-weight:600; } .tag-medium { background:#78350f; color:#fcd34d; padding:2px 8px; border-radius:8px; font-size:12px; font-weight:600; } .tag-low { background:#1f2937; color:#9ca3af; padding:2px 8px; border-radius:8px; font-size:12px; font-weight:600; }</style>", unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
-
-    industry = st.selectbox(
-        "🏭 Industry preset",
-        get_available_industries(),
-        help="Select the industry to load the matching skills taxonomy for.",
-    )
-
-    keyword_weight = st.slider(
-        "🔑 Keyword vs Semantic weight",
-        min_value=0.0, max_value=1.0, value=0.4, step=0.05,
-        help=(
-            "Higher = more weight on exact skill keyword matching. "
-            "Lower = more weight on AI semantic similarity."
-        ),
-    )
-
-    model_choice = st.selectbox(
-        "🤖 Embedding model",
-        ["Fast — all-MiniLM-L6-v2 (~80 MB)", "Accurate — all-mpnet-base-v2 (~420 MB)"],
-        help="Accurate model gives better semantic matching but is slower and larger to download.",
-    )
-    model_name = (
-        "all-MiniLM-L6-v2"
-        if "MiniLM" in model_choice
-        else "all-mpnet-base-v2"
-    )
-
+    ind_key = TAXONOMY_OPTIONS[st.selectbox("Industry Preset", list(TAXONOMY_OPTIONS))]
+    kw_w = st.slider("Keyword vs Semantic Weight", 0.0, 1.0, 0.4, 0.05)
+    model_name = "all-MiniLM-L6-v2" if "MiniLM" in st.selectbox("Embedding Model", ["Fast — all-MiniLM-L6-v2 (~80 MB)", "all-mpnet-base-v2 (~420 MB)"]) else "all-mpnet-base-v2"
     st.divider()
-    st.markdown("## 🔑 AI Rewrites (Optional)")
-
-    # Load key silently — checks Streamlit Cloud secrets first, then local .env
-    # Never expose the key value in the UI
-    try:
-        _env_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        _env_key = ""
-    if not _env_key:
-        _env_key = os.getenv("GEMINI_API_KEY", "")
-
-    if _env_key:
-        # Key found in environment — show badge only, never display the key
-        gemini_api_key = _env_key
-        st.success("✅ AI rewrites enabled")
-        st.caption("🔒 API key loaded securely from environment.")
-    else:
-        # No env key — let the user paste their own (empty field, no pre-fill)
-        st.caption(
-            "Enter your free Gemini API key to get AI-generated, copy-paste-ready "
-            "resume bullet rewrites instead of generic suggestions.\n\n"
-            "[Get a free key →](https://aistudio.google.com/app/apikey)"
-        )
-        gemini_api_key = st.text_input(
-            "Gemini API key",
-            value="",
-            type="password",
-            placeholder="AIza...",
-            help="Your key is only used for this session and never stored.",
-        )
-        if gemini_api_key:
-            st.success("✅ AI rewrites enabled")
-
-    st.divider()
-    st.markdown(
-        "**How scoring works**\n\n"
-        f"Final score = {int(keyword_weight*100)}% keyword overlap + "
-        f"{int((1-keyword_weight)*100)}% semantic similarity"
-    )
-    st.caption("v2.0 · Made with ❤️ using spaCy + Sentence Transformers")
-
-
-# ---------------------------------------------------------------------------
-# Cached resources — reload when industry or model changes
-# ---------------------------------------------------------------------------
-@st.cache_resource
-def load_skill_extractor(industry_key: str):
-    taxonomy_path = TAXONOMY_FILES[industry_key]
-    return SkillExtractor(taxonomy_path=taxonomy_path)
-
+    gemini_key = st.text_input("Gemini API Key (Optional)", type="password", value=os.getenv("GEMINI_API_KEY", ""))
+    if gemini_key:
+        st.success("✅ AI Rewrites Active")
 
 @st.cache_resource
-def load_embedding_model(model_id: str):
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(model_id)
+def get_ext(k): return SkillExtractor(k)
+@st.cache_resource
+def get_emb(m): return SentenceTransformer(m)
+ext, embed_model = get_ext(ind_key), get_emb(model_name)
 
+if "resume_clean" not in st.session_state:
+    st.session_state.update({"resume_raw": "", "resume_clean": "", "resume_skills": set(), "resume_emb": None, "label": "", "job_bank": []})
 
-@st.cache_data
-def load_sample_resumes():
-    if not os.path.exists(SAMPLE_RESUMES_PATH):
-        return pd.DataFrame(columns=["Category", "Resume_str", "Resume_clean", "skills"])
-    df = pd.read_csv(SAMPLE_RESUMES_PATH)
-    df["skills"] = df["skills"].apply(ast.literal_eval)
-    return df
+def run_analysis(title, text_raw):
+    j_clean = clean_text(text_raw)
+    j_skills = ext.extract(segment_skills(j_clean, ext))
+    j_emb = embed_model.encode(j_clean)
+    res = compute_match(st.session_state.resume_clean, st.session_state.resume_skills, st.session_state.resume_emb, j_clean, j_skills, j_emb, kw_w)
+    res.update({"title": title, "raw": text_raw, "clean": j_clean, "skills": j_skills, "ats": compute_ats_score(st.session_state.resume_raw, st.session_state.resume_clean, j_skills, st.session_state.resume_skills), "seniority": detect_seniority(st.session_state.resume_clean, j_clean, title), "bench": get_benchmark(res["final_score"])})
+    return res
 
+def render_result(r):
+    score = int(r["final_score"] * 100)
+    col = "#22c55e" if score >= 70 else ("#f59e0b" if score >= 50 else "#ef4444")
+    st.markdown(f"<div style='background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:16px;margin:12px 0;'><h2 style='color:{col};margin:0;'>{score}% Overall Match</h2><p style='color:#94a3b8;margin:4px 0 0;'>Estimated to beat ~<b>{r['bench']}%</b> of applicants</p></div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Keywords", f"{int(r['jaccard']*100)}%")
+    c2.metric("Semantic", f"{int(r['semantic']*100)}%")
+    c3.metric("ATS Score", f"{r['ats']['score']}/100")
+    c4.metric("Skills Matched", f"{len(r['matched_skills'])}/{len(r['matched_skills']) + len(r['missing_skills'])}")
+    if r["seniority"]:
+        st.warning(r["seniority"]["message"])
+    with st.expander("📋 ATS Checklist"):
+        for lbl, ok in r["ats"]["checks"]:
+            st.write(f"{'✅' if ok else '⚠️'} {lbl}")
+    sc1, sc2 = st.columns([1, 2])
+    with sc1:
+        st.plotly_chart(plot_donut(len(r["matched_skills"]), len(r["missing_skills"])), use_container_width=True)
+    with sc2:
+        m_grp = group_skills(r["matched_skills"], ext)
+        ms_grp = group_skills(r["missing_skills"], ext)
+        def cat_tag(cat_name, m_items, ms_items):
+            tot = len(m_items) + len(ms_items)
+            pct = int((len(m_items) / tot) * 100) if tot else 100
+            return f"{cat_name}: **{pct}%** ({len(m_items)}/{tot})" if tot else None
+        c_tags = [t for t in [cat_tag("Core Tech", m_grp["technical"], ms_grp["technical"]),
+                              cat_tag("Tools & Cloud", m_grp["tool"], ms_grp["tool"]),
+                              cat_tag("Soft Skills", m_grp["soft"], ms_grp["soft"])] if t]
+        if c_tags:
+            st.markdown("📊 **Skill Breakdown:** " + " | ".join(c_tags))
+        st.markdown(f"**🟢 Matched ({len(r['matched_skills'])}):** " + (", ".join(f"`{s}`" for s in r["matched_skills"]) or "None"))
+        if m_grp["tool"]: st.caption("Tools/Platforms: " + ", ".join(f"`{s}`" for s in m_grp["tool"]))
+        st.markdown(f"**🔴 Missing ({len(r['missing_skills'])}):** " + (", ".join(f"`{s}`" for s in r["missing_skills"]) or "None"))
+        if ms_grp["tool"]: st.caption("Tools/Platforms Missing: " + ", ".join(f"`{s}`" for s in ms_grp["tool"]))
+    if r["missing_skills"]:
+        st.markdown("### 💡 Recommended Bullet Improvements")
+        ranked = rank_missing(r["missing_skills"], r["title"], r["clean"], ext)
+        suggs = generate_suggestions(ranked, r["raw"], st.session_state.resume_raw, ext, gemini_key)
+        st.session_state["last_suggestions"] = suggs
+        for s in suggs:
+            badge = "✨ AI" if s["ai"] else "Template"
+            st.markdown(f"**{s['skill']}** <span class='tag-{s['priority'].lower()}'>{s['priority']} Priority</span> [{badge}]<br>{s['suggestion']}", unsafe_allow_html=True)
 
-extractor = load_skill_extractor(industry)
-embed_model = load_embedding_model(model_name)
-sample_resumes = load_sample_resumes()
-has_sample_resumes = len(sample_resumes) > 0
+    with st.expander("📊 Full Skill Gap & ATS Coverage Matrix"):
+        all_skills = sorted(list(r["matched_skills"]) + list(r["missing_skills"]))
+        matrix_data = []
+        for s in all_skills:
+            is_matched = s in r["matched_skills"]
+            cat = ext.skill_categories.get(s, "technical").capitalize()
+            matrix_data.append({"Skill": s, "Category": cat, "In Resume": "✅ Present" if is_matched else "❌ Missing", "ATS Status": "Matched" if is_matched else "Critical Gap"})
+        st.dataframe(pd.DataFrame(matrix_data), use_container_width=True)
 
+    # 1-Click Action Report Download
+    report_md = f"""# Resume Match & ATS Audit Report
+**Target Role:** {r['title'] or 'Target Role'}
+**Overall Match Score:** {score}%
+**Estimated Applicant Percentile:** Beats ~{r['bench']}% of applicants
+**ATS Compatibility Score:** {r['ats']['score']}/100
+**Keyword Overlap:** {int(r['jaccard']*100)}%
+**Semantic Similarity:** {int(r['semantic']*100)}%
 
-# ---------------------------------------------------------------------------
-# Session state initialisation
-# ---------------------------------------------------------------------------
-def init_session():
-    defaults = {
-        "resume_text_raw": None,
-        "resume_clean": None,
-        "resume_skills": None,
-        "resume_embedding": None,
-        "resume_source_label": None,
-        "job_bank": [],           # list of {"label", "title", "text_raw", "text_clean"}
-        "compare_results": [],    # list of result dicts
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+## Matched Skills ({len(r['matched_skills'])})
+{', '.join(r['matched_skills']) if r['matched_skills'] else 'None'}
 
-init_session()
+## Missing Skills ({len(r['missing_skills'])})
+{', '.join(r['missing_skills']) if r['missing_skills'] else 'None'}
 
+## ATS Diagnostic Breakdown
+""" + "\n".join(f"- [{'x' if ok else ' '}] {lbl}" for lbl, ok in r['ats']['checks'])
+    st.download_button("📥 Download Analysis Report (Markdown)", data=report_md, file_name=f"Match_Report_{re.sub(r'[^a-zA-Z0-9_]', '_', r['title'] or 'job')}.md", mime="text/markdown", use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Helper: run full analysis for one job
-# ---------------------------------------------------------------------------
-def run_analysis(job_title: str, job_text_raw: str) -> dict:
-    job_clean = clean_text(job_text_raw)
-    job_skills = extractor.extract(segment_concatenated_skills(job_clean, extractor))
-    job_embedding = embed_model.encode(job_clean)
-
-    result = compute_match(
-        st.session_state.resume_clean,
-        st.session_state.resume_skills,
-        st.session_state.resume_embedding,
-        job_clean,
-        job_skills,
-        job_embedding,
-        keyword_weight=keyword_weight,
-    )
-    result["ats"] = compute_ats_score(
-        st.session_state.resume_text_raw,
-        st.session_state.resume_clean,
-        job_skills,
-        st.session_state.resume_skills,
-    )
-    result["seniority"] = detect_seniority_mismatch(
-        st.session_state.resume_clean, job_clean, job_title
-    )
-    result["benchmark"] = get_benchmark_percentile(result["final_score"])
-    result["job_title"] = job_title
-    result["job_clean"] = job_clean
-    result["job_text_raw"] = job_text_raw
-    result["job_skills"] = job_skills
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Helper: render full result panel
-# ---------------------------------------------------------------------------
-def render_result(result: dict, expanded: bool = True):
-    score_pct = int(result["final_score"] * 100)
-    ats_score = result["ats"]["score"]
-    benchmark = result["benchmark"]
-
-    # Score banner
-    st.markdown(f"""
-    <div style='background:linear-gradient(135deg,#1a1d2e,#0f1117);
-                border:1px solid #2d3748;border-radius:16px;padding:20px 24px;margin-bottom:16px;'>
-        <div style='display:flex;align-items:center;gap:16px;flex-wrap:wrap;'>
-            <div>
-                <div style='font-size:48px;font-weight:800;color:{"#22c55e" if score_pct>=70 else "#f59e0b" if score_pct>=50 else "#ef4444"};line-height:1;'>
-                    {score_pct}%
-                </div>
-                <div style='color:#9ca3af;font-size:14px;margin-top:4px;'>Overall Match</div>
-            </div>
-            <div style='flex:1;min-width:200px;'>
-                <div style='color:#d1d5db;font-size:14px;margin-bottom:8px;'>
-                    🏆 Your resume scores better than ~<b>{benchmark}%</b> of applicants (estimated)
-                </div>
-                <div style='background:#1f2937;border-radius:8px;height:8px;'>
-                    <div style='background:{"#22c55e" if score_pct>=70 else "#f59e0b" if score_pct>=50 else "#ef4444"};
-                                width:{score_pct}%;height:8px;border-radius:8px;'></div>
-                </div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Key metrics
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🔑 Keyword Overlap", f"{int(result['jaccard'] * 100)}%")
-    m2.metric("🧠 Semantic Similarity", f"{int(result['semantic'] * 100)}%")
-    m3.metric("📋 ATS Score", f"{ats_score}/100",
-              delta="Good" if ats_score >= 75 else ("Needs work" if ats_score >= 50 else "Weak"),
-              delta_color="normal" if ats_score >= 75 else "inverse")
-    m4.metric("🎯 Skills Matched", f"{len(result['matched_skills'])}/{len(result['matched_skills'])+len(result['missing_skills'])}")
-
-    # Seniority warning
-    if result.get("seniority"):
-        if result["seniority"]["type"] == "underqualified":
-            st.warning(result["seniority"]["message"])
-        else:
-            st.info(result["seniority"]["message"])
-
-    st.divider()
-
-    # ATS checks
-    with st.expander("📋 ATS Compatibility Details", expanded=False):
-        for check_label, passed in result["ats"]["checks"]:
-            icon = "✅" if passed else "⚠️"
-            st.write(f"{icon} {check_label}")
-        st.caption(
-            "Heuristic estimate based on structure, contact info, keyword coverage, "
-            "and readability — not a simulation of any real ATS product."
-        )
-
-    # Skill coverage
-    st.markdown("### 📊 Skill Coverage")
-    chart_col, legend_col = st.columns([1, 2])
-    with chart_col:
-        fig = build_donut_chart(len(result["matched_skills"]), len(result["missing_skills"]))
-        st.plotly_chart(fig, use_container_width=True)
-    with legend_col:
-        st.markdown(f"🟢 **Matched:** {len(result['matched_skills'])} skills")
-        st.markdown(f"🔴 **Missing:** {len(result['missing_skills'])} skills")
-        st.caption(
-            "Coverage = share of the job's required skills your resume already mentions. "
-            "Based on exact skill-name matches from the taxonomy."
-        )
-
-    # Matched / missing skills side by side
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("### ✅ Matched Skills")
-        if result["matched_skills"]:
-            st.write(" ".join([f"`{s}`" for s in result["matched_skills"]]))
-        else:
-            st.write("No exact skill overlap found.")
-
-    with col_b:
-        st.markdown("### ❌ Missing Skills")
-        if result["missing_skills"]:
-            ranked_missing = rank_missing_skills(
-                result["missing_skills"],
-                result.get("job_title", ""),
-                result["job_clean"],
-                extractor,
-            )
-            priority_colors = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
-            for skill, label, score in ranked_missing:
-                st.markdown(
-                    f"{priority_colors[label]} `{skill}` — "
-                    f"<span class='tag-{label.lower()}'>{label} priority</span>",
-                    unsafe_allow_html=True,
-                )
-            st.caption("Priority = how often the skill appears in the job posting + title.")
-        else:
-            ranked_missing = []
-            st.success("No missing skills detected — strong match! 🎉")
-
-    # Suggestions
-    if result["missing_skills"]:
-        st.markdown("### 💡 How to Improve Your Resume")
-
-        if gemini_api_key:
-            with st.spinner("🤖 Generating AI-powered bullet rewrites..."):
-                suggestions = generate_ai_suggestions(
-                    ranked_missing,
-                    result["job_text_raw"],
-                    st.session_state.resume_text_raw,
-                    gemini_api_key,
-                    top_n=5,
-                )
-            if not suggestions:
-                st.caption("AI generation failed — falling back to templates.")
-                suggestions = generate_template_suggestions(ranked_missing, extractor, top_n=5)
-        else:
-            suggestions = generate_template_suggestions(ranked_missing, extractor, top_n=5)
-
-        for s in suggestions:
-            badge = (
-                "<span class='badge-ai'>✨ AI</span>"
-                if s.get("ai_powered")
-                else "<span class='badge-tmpl'>template</span>"
-            )
-            priority_tag = f"<span class='tag-{s['priority'].lower()}'>{s['priority']}</span>"
-            st.markdown(
-                f"**{s['skill']}** {priority_tag} {badge}<br>"
-                f"{s['suggestion']}",
-                unsafe_allow_html=True,
-            )
-            st.write("")
-
-    # Download report
-    st.divider()
-    report = {
-        "job_title": result.get("job_title", ""),
-        "overall_match_pct": int(result["final_score"] * 100),
-        "keyword_overlap_pct": int(result["jaccard"] * 100),
-        "semantic_similarity_pct": int(result["semantic"] * 100),
-        "ats_score": result["ats"]["score"],
-        "benchmark_beats_pct": result["benchmark"],
-        "matched_skills": result["matched_skills"],
-        "missing_skills": result["missing_skills"],
-        "seniority_flag": result.get("seniority"),
-    }
-    st.download_button(
-        "⬇️ Download Report (JSON)",
-        data=json.dumps(report, indent=2),
-        file_name=f"match_report_{result.get('job_title','job').replace(' ','_')[:30]}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    with st.expander("ℹ️ How this score is calculated"):
-        st.markdown(f"""
-        - **Keyword overlap (Jaccard):** Measures exact skill-word overlap between resume and job. Weight: **{int(keyword_weight*100)}%**
-        - **Semantic similarity:** Uses AI embeddings (`{model_name}`) to compare overall meaning, catching related skills phrased differently. Weight: **{int((1-keyword_weight)*100)}%**
-        - **Final score** = weighted average of both
-        - **ATS score** = heuristic based on structure, contact info, keyword coverage, resume length, and quantifiable achievements
-        - **Benchmark** = estimated percentile vs. a typical distribution of applicant scores
-        """)
-
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.markdown("""
-<h1 style='text-align:center;background:linear-gradient(90deg,#6366f1,#8b5cf6,#ec4899);
-           -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-           font-size:2.5rem;margin-bottom:4px;'>
-    🧩 Resume ↔ Job Matcher
-</h1>
-<p style='text-align:center;color:#9ca3af;font-size:1rem;margin-bottom:24px;'>
-    Upload your resume once · Compare multiple jobs · Get AI-powered improvement tips
-</p>
-""", unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# Step 1 — Resume (persists in session)
-# ---------------------------------------------------------------------------
-st.markdown("## Step 1 — Load Your Resume")
-
-resume_loaded = st.session_state.resume_text_raw is not None
-
-if resume_loaded:
-    st.success(
-        f"✅ Resume loaded: **{st.session_state.resume_source_label}** "
-        f"({len(st.session_state.resume_text_raw.split())} words, "
-        f"{len(st.session_state.resume_skills)} skills extracted)"
-    )
-    if st.button("🔄 Load a different resume", use_container_width=False):
-        for k in ["resume_text_raw", "resume_clean", "resume_skills",
-                  "resume_embedding", "resume_source_label"]:
-            st.session_state[k] = None
+# Main UI
+st.markdown("<h1 style='text-align:center;color:#6366f1;'>🧩 Resume ↔ Job Matcher & ATS Analytics</h1>", unsafe_allow_html=True)
+st.markdown("## Step 1 — Load Resume")
+if st.session_state.resume_clean:
+    st.success(f"✅ Loaded: **{st.session_state.label}** ({len(st.session_state.resume_skills)} skills extracted)")
+    with st.expander(f"🔎 View Detected Skills in Resume ({len(st.session_state.resume_skills)} skills)"):
+        rg = group_skills(st.session_state.resume_skills, ext)
+        if rg["technical"]: st.markdown("**Technical Core:** " + ", ".join(f"`{s}`" for s in sorted(rg["technical"])))
+        if rg["tool"]: st.markdown("**Tools & Cloud:** " + ", ".join(f"`{s}`" for s in sorted(rg["tool"])))
+        if rg["soft"]: st.markdown("**Soft Skills:** " + ", ".join(f"`{s}`" for s in sorted(rg["soft"])))
+    if st.button("🔄 Change Resume"):
+        st.session_state.update({"resume_raw": "", "resume_clean": "", "resume_skills": set(), "resume_emb": None, "label": "", "last_analysis": None})
         st.rerun()
 else:
-    source_options = ["Upload a resume (PDF or DOCX)"]
-    if has_sample_resumes:
-        source_options.append("Use a sample resume")
-
-    resume_source = st.radio("Resume source", source_options, horizontal=True)
-
-    if resume_source == "Upload a resume (PDF or DOCX)":
-        uploaded_file = st.file_uploader(
-            "Upload your resume", type=["pdf", "docx"]
-        )
-        if uploaded_file:
-            with st.spinner("Reading file..."):
-                text, err = extract_resume_text(uploaded_file)
-            if err:
-                st.error(err)
-            elif text:
-                st.success(f"Extracted {len(text.split())} words from **{uploaded_file.name}**")
-                with st.expander("Preview extracted text"):
-                    st.write(text[:1500] + ("..." if len(text) > 1500 else ""))
-                if st.button("✅ Use this resume", type="primary"):
-                    with st.spinner("Processing resume..."):
-                        clean = clean_text(text)
-                        skills = extractor.extract(segment_concatenated_skills(clean, extractor))
-                        embedding = embed_model.encode(clean)
-                    st.session_state.resume_text_raw = text
-                    st.session_state.resume_clean = clean
-                    st.session_state.resume_skills = skills
-                    st.session_state.resume_embedding = embedding
-                    st.session_state.resume_source_label = uploaded_file.name
-                    st.rerun()
-    else:
-        resume_options = sample_resumes.apply(
-            lambda r: f"{r['Category']} — Resume #{r.name}", axis=1
-        ).tolist()
-        selected_label = st.selectbox("Sample resume", resume_options)
-        selected_idx = resume_options.index(selected_label)
-        selected_resume = sample_resumes.iloc[selected_idx]
-
-        with st.expander("Preview resume text"):
-            st.write(str(selected_resume["Resume_str"])[:1500] + "...")
-
-        if st.button("✅ Use this resume", type="primary"):
-            with st.spinner("Processing sample resume..."):
-                raw = selected_resume["Resume_str"]
-                clean = (
-                    selected_resume["Resume_clean"]
-                    if "Resume_clean" in selected_resume
-                    else clean_text(raw)
-                )
-                skills = set(selected_resume["skills"]) if isinstance(selected_resume["skills"], list) else selected_resume["skills"]
-                embedding = embed_model.encode(clean)
-            st.session_state.resume_text_raw = raw
-            st.session_state.resume_clean = clean
-            st.session_state.resume_skills = skills
-            st.session_state.resume_embedding = embedding
-            st.session_state.resume_source_label = selected_label
+    mode = st.radio("Resume Source", ["Use Preloaded Sample Resume", "Upload File (PDF / DOCX)"], horizontal=True)
+    if mode == "Use Preloaded Sample Resume":
+        if st.button("✅ Load Alex Chen (Data Scientist Sample)", type="primary"):
+            c = clean_text(SAMPLE_RESUME)
+            st.session_state.update({"resume_raw": SAMPLE_RESUME, "resume_clean": c, "resume_skills": ext.extract(segment_skills(c, ext)), "resume_emb": embed_model.encode(c), "label": "Alex Chen (Sample)", "last_analysis": None})
             st.rerun()
+    else:
+        f = st.file_uploader("Upload Resume", type=["pdf", "docx", "txt"])
+        if f and st.button("✅ Analyze Uploaded File", type="primary"):
+            txt, err = extract_resume_text(f)
+            if err: st.error(err)
+            else:
+                c = clean_text(txt)
+                st.session_state.update({"resume_raw": txt, "resume_clean": c, "resume_skills": ext.extract(segment_skills(c, ext)), "resume_emb": embed_model.encode(c), "label": f.name, "last_analysis": None})
+                st.rerun()
 
 st.divider()
-
-# ---------------------------------------------------------------------------
-# Tabs — only show after resume is loaded
-# ---------------------------------------------------------------------------
-if not resume_loaded:
-    st.info("⬆️ Load your resume above to get started.")
+if not st.session_state.resume_clean:
+    st.info("⬆️ Load a resume above to proceed.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs([
-    "🔍 Analyze Single Job",
-    "📊 Compare Multiple Jobs",
-    "✏️ Resume Editor (Live Score)",
-])
+tab1, tab2, tab3 = st.tabs(["🔍 Analyze Single Job", "📊 Compare Multiple Jobs", "✏️ Live Resume Editor"])
 
-
-# ===========================================================================
-# TAB 1 — Single Job Analysis
-# ===========================================================================
 with tab1:
-    st.markdown("## Step 2 — Enter a Job Description")
-
-    job_title_input = st.text_input(
-        "Job title (optional — improves skill priority ranking)",
-        placeholder="e.g. Senior Data Engineer",
-        key="tab1_title",
-    )
-
-    job_input_method = st.radio(
-        "How do you want to provide the job?",
-        ["📋 Paste job description", "🔗 Paste job URL (auto-fetch)"],
-        horizontal=True,
-        key="tab1_method",
-    )
-
-    job_text_raw = ""
-
-    if job_input_method == "📋 Paste job description":
-        job_text_raw = st.text_area(
-            "Job description",
-            height=200,
-            placeholder="Paste the full job description here...",
-            key="tab1_paste",
-        )
+    inp_mode = st.radio("Input Format", ["Quick Load Sample Job", "Paste Job Text", "Fetch URL"], horizontal=True)
+    title = ""
+    j_text = ""
+    if inp_mode == "Quick Load Sample Job":
+        chosen_j = st.selectbox("Select Target Job", list(SAMPLE_JOBS.keys()))
+        title = chosen_j.split(" (")[0]
+        j_text = SAMPLE_JOBS[chosen_j]
+        with st.expander("Preview Job Description"):
+            st.text(j_text)
+    elif inp_mode == "Paste Job Text":
+        title = st.text_input("Job Title", placeholder="e.g. Senior Machine Learning Engineer")
+        j_text = st.text_area("Job Description", height=200)
     else:
-        job_url = st.text_input(
-            "Job posting URL",
-            placeholder="https://indeed.com/viewjob?jk=...",
-            key="tab1_url",
-        )
-        if job_url:
-            if st.button("🌐 Fetch job description", key="tab1_fetch"):
-                with st.spinner("Fetching job description..."):
-                    fetched_text, fetch_err = fetch_job_from_url(job_url)
-                if fetch_err:
-                    st.error(fetch_err)
-                elif fetched_text:
-                    st.session_state["tab1_fetched"] = fetched_text
-                    st.success(f"Fetched {len(fetched_text.split())} words from URL.")
-
-        if "tab1_fetched" in st.session_state and st.session_state["tab1_fetched"]:
-            job_text_raw = st.session_state["tab1_fetched"]
-            with st.expander("Preview fetched text"):
-                st.write(job_text_raw[:1000] + "...")
-
-    if st.button("🔍 Analyze Match", type="primary", use_container_width=True, key="tab1_analyze"):
-        if not job_text_raw.strip():
-            st.warning("Please provide a job description first.")
+        title = st.text_input("Job Title", placeholder="e.g. Senior Machine Learning Engineer")
+        url = st.text_input("Posting URL")
+        if url and st.button("Fetch"):
+            txt, err = fetch_url(url)
+            if err: st.error(err)
+            else: st.session_state["f_text"] = txt; st.success("Fetched!")
+        j_text = st.session_state.get("f_text", "")
+    if st.button("🚀 Analyze Match", type="primary", use_container_width=True):
+        if j_text.strip():
+            st.session_state["last_analysis"] = run_analysis(title, j_text)
+            st.session_state["last_job_text"] = j_text
+            st.session_state["last_job_title"] = title
         else:
-            with st.spinner("Analyzing..."):
-                result = run_analysis(job_title_input, job_text_raw)
-            render_result(result)
+            st.warning("Please provide job text.")
+    if st.session_state.get("last_analysis"):
+        render_result(st.session_state["last_analysis"])
 
-
-# ===========================================================================
-# TAB 2 — Multi-Job Comparison
-# ===========================================================================
 with tab2:
-    st.markdown("## Compare Your Resume Against Multiple Jobs")
-    st.caption("Add up to 5 jobs and see them ranked by match score.")
+    st.markdown("### Compare Multiple Roles")
+    tb_c1, tb_c2 = st.columns([1, 1])
+    with tb_c1:
+        if st.button("⚡ Load 3 Sample Roles into Bank"):
+            st.session_state.job_bank = [{"title": k, "text": v} for k, v in SAMPLE_JOBS.items()]
+            st.rerun()
+    with tb_c2:
+        if st.session_state.job_bank and st.button("🗑️ Clear Bank"):
+            st.session_state.job_bank = []
+            st.rerun()
 
-    with st.expander("➕ Add a Job", expanded=len(st.session_state.job_bank) == 0):
-        cj_title = st.text_input("Job title", placeholder="e.g. Data Scientist at Google", key="cj_title")
-        cj_method = st.radio(
-            "Input method",
-            ["📋 Paste text", "🔗 Paste URL"],
-            horizontal=True,
-            key="cj_method",
-        )
-
-        cj_text = ""
-        if cj_method == "📋 Paste text":
-            cj_text = st.text_area("Job description", height=150, key="cj_paste")
-        else:
-            cj_url = st.text_input("Job URL", placeholder="https://...", key="cj_url")
-            if cj_url and st.button("🌐 Fetch", key="cj_fetch"):
-                with st.spinner("Fetching..."):
-                    cj_fetched, cj_err = fetch_job_from_url(cj_url)
-                if cj_err:
-                    st.error(cj_err)
-                else:
-                    st.session_state["cj_fetched"] = cj_fetched
-                    st.success(f"Fetched {len(cj_fetched.split())} words.")
-            if "cj_fetched" in st.session_state:
-                cj_text = st.session_state.get("cj_fetched", "")
-                st.caption(f"Using fetched text ({len(cj_text.split())} words)")
-
-        if st.button("➕ Add to comparison", key="cj_add", type="primary"):
-            if not cj_text.strip():
-                st.warning("Please provide a job description.")
-            elif len(st.session_state.job_bank) >= 5:
-                st.warning("Maximum 5 jobs. Remove one first.")
-            else:
-                label = cj_title.strip() or f"Job {len(st.session_state.job_bank) + 1}"
-                st.session_state.job_bank.append({
-                    "label": label,
-                    "title": cj_title.strip(),
-                    "text_raw": cj_text,
-                })
-                st.session_state.pop("cj_fetched", None)
-                st.success(f"Added: **{label}**")
-                st.rerun()
-
+    ctitle = st.text_input("Role Title", key="c_t")
+    ctext = st.text_area("Role Description", height=120, key="c_d")
+    if st.button("➕ Add to Comparison Bank") and ctext.strip():
+        st.session_state.job_bank.append({"title": ctitle or f"Job {len(st.session_state.job_bank)+1}", "text": ctext})
+        st.rerun()
     if st.session_state.job_bank:
-        st.markdown(f"### {len(st.session_state.job_bank)} Job(s) in comparison")
+        for i, j in enumerate(st.session_state.job_bank):
+            st.write(f"**{i+1}.** {j['title']}")
+        if st.button("⚡ Run Comparison", type="primary", use_container_width=True):
+            res_list = [{**run_analysis(j['title'], j['text']), "label": j['title']} for j in st.session_state.job_bank]
+            st.dataframe(pd.DataFrame([{
+                "Job": r["label"], "Overall Match": f"{int(r['final_score']*100)}%",
+                "Keywords": f"{int(r['jaccard']*100)}%", "Semantic": f"{int(r['semantic']*100)}%",
+                "ATS": f"{r['ats']['score']}/100", "Matched Skills": len(r["matched_skills"]),
+                "Missing Skills": len(r["missing_skills"])
+            } for r in sorted(res_list, key=lambda x: x["final_score"], reverse=True)]), use_container_width=True)
+            st.plotly_chart(plot_bar(res_list), use_container_width=True)
 
-        # Remove buttons
-        for i, job in enumerate(st.session_state.job_bank):
-            col_l, col_r = st.columns([4, 1])
-            col_l.markdown(f"**{i+1}.** {job['label']}")
-            if col_r.button("🗑️ Remove", key=f"remove_{i}"):
-                st.session_state.job_bank.pop(i)
-                st.rerun()
-
-        if st.button("⚡ Run Comparison", type="primary", use_container_width=True, key="cj_run"):
-            compare_results = []
-            progress = st.progress(0)
-            for i, job in enumerate(st.session_state.job_bank):
-                with st.spinner(f"Analyzing: {job['label']}..."):
-                    r = run_analysis(job["title"], job["text_raw"])
-                    r["label"] = job["label"]
-                    compare_results.append(r)
-                progress.progress((i + 1) / len(st.session_state.job_bank))
-            st.session_state.compare_results = compare_results
-
-        if st.session_state.compare_results:
-            results = sorted(st.session_state.compare_results, key=lambda x: x["final_score"], reverse=True)
-
-            # Summary table
-            st.markdown("### 📊 Ranked Results")
-            table_data = []
-            for rank, r in enumerate(results, 1):
-                score_pct = int(r["final_score"] * 100)
-                emoji = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
-                table_data.append({
-                    "Rank": emoji,
-                    "Job": r["label"],
-                    "Overall Match": f"{score_pct}%",
-                    "Keywords": f"{int(r['jaccard']*100)}%",
-                    "Semantic": f"{int(r['semantic']*100)}%",
-                    "ATS": f"{r['ats']['score']}/100",
-                    "Matched Skills": len(r["matched_skills"]),
-                    "Missing Skills": len(r["missing_skills"]),
-                })
-            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-
-            # Bar chart
-            st.plotly_chart(
-                build_comparison_bar_chart(results),
-                use_container_width=True,
-            )
-
-            # Expandable details per job
-            st.markdown("### 📂 Detailed Results per Job")
-            for r in results:
-                with st.expander(f"{r['label']} — {int(r['final_score']*100)}% match"):
-                    render_result(r, expanded=False)
-
-
-# ===========================================================================
-# TAB 3 — Live Resume Editor
-# ===========================================================================
 with tab3:
-    st.markdown("## ✏️ Resume Editor — See Your Score Update Live")
-    st.caption(
-        "Edit your resume text below and pick a job to score against. "
-        "The score updates every time you click **Re-score**."
-    )
-
-    editor_col, job_col = st.columns([3, 2])
-
-    with editor_col:
-        st.markdown("#### Your Resume (editable)")
-        edited_resume = st.text_area(
-            "Resume text",
-            value=st.session_state.resume_text_raw or "",
-            height=400,
-            key="editor_resume",
-            label_visibility="collapsed",
-        )
-
-    with job_col:
-        st.markdown("#### Job to score against")
-        editor_job_title = st.text_input("Job title", placeholder="e.g. Data Analyst", key="editor_title")
-        editor_job_text = st.text_area(
-            "Job description",
-            height=280,
-            placeholder="Paste a job description...",
-            key="editor_job",
-        )
-
-    if st.button("🔄 Re-score", type="primary", use_container_width=True, key="editor_score"):
-        if not edited_resume.strip():
-            st.warning("Resume text is empty.")
-        elif not editor_job_text.strip():
-            st.warning("Please paste a job description to score against.")
-        else:
-            with st.spinner("Scoring..."):
-                # Temporarily use the edited resume for scoring
-                edited_clean = clean_text(edited_resume)
-                edited_skills = extractor.extract(segment_concatenated_skills(edited_clean, extractor))
-                edited_embedding = embed_model.encode(edited_clean)
-
-                job_clean = clean_text(editor_job_text)
-                job_skills = extractor.extract(segment_concatenated_skills(job_clean, extractor))
-                job_embedding = embed_model.encode(job_clean)
-
-                result = compute_match(
-                    edited_clean, edited_skills, edited_embedding,
-                    job_clean, job_skills, job_embedding,
-                    keyword_weight=keyword_weight,
-                )
-
-            score_pct = int(result["final_score"] * 100)
-
-            # Before/after delta if session resume exists
-            original_skills = st.session_state.resume_skills or set()
-            original_embedding = st.session_state.resume_embedding
-            if original_embedding is not None:
-                from src.matching import compute_match as _cm
-                orig_result = _cm(
-                    st.session_state.resume_clean,
-                    original_skills,
-                    original_embedding,
-                    job_clean,
-                    job_skills,
-                    job_embedding,
-                    keyword_weight=keyword_weight,
-                )
-                orig_pct = int(orig_result["final_score"] * 100)
-                delta = score_pct - orig_pct
-                delta_str = f"+{delta}%" if delta >= 0 else f"{delta}%"
-                st.metric(
-                    "📈 Match Score (edited resume)",
-                    f"{score_pct}%",
-                    delta=delta_str,
-                    delta_color="normal" if delta >= 0 else "inverse",
-                )
-                if delta > 0:
-                    st.success(f"Your edits improved the match by **{delta} percentage points**! 🎉")
-                elif delta < 0:
-                    st.warning(f"Your edits lowered the match by {abs(delta)} points.")
-                else:
-                    st.info("Score unchanged.")
-            else:
-                st.metric("Match Score", f"{score_pct}%")
-
-            col_x, col_y = st.columns(2)
-            with col_x:
-                st.markdown("**✅ Matched Skills**")
-                st.write(" ".join([f"`{s}`" for s in sorted(result["matched_skills"])]) or "None")
-            with col_y:
-                st.markdown("**❌ Missing Skills**")
-                st.write(" ".join([f"`{s}`" for s in sorted(result["missing_skills"])]) or "None")
-
-            if st.button("💾 Save edited resume to session", key="save_edited"):
-                st.session_state.resume_text_raw = edited_resume
-                st.session_state.resume_clean = edited_clean
-                st.session_state.resume_skills = edited_skills
-                st.session_state.resume_embedding = edited_embedding
-                st.session_state.resume_source_label = "Edited resume"
-                st.success("Saved! Your edited resume is now active across all tabs.")
+    st.markdown("### ✏️ Real-Time Resume Editor & Optimizer")
+    st.caption("Edit your resume content to see real-time match score delta and export your optimized version.")
+    if st.session_state.get("last_suggestions"):
+        if st.button("⚡ Auto-Append Recommended Missing Skill Bullets into Resume"):
+            appended = "\n\nKEY ACHIEVEMENTS & SKILLS:\n" + "\n".join(f"- {s['suggestion']}" for s in st.session_state["last_suggestions"])
+            st.session_state.resume_raw = st.session_state.resume_raw + appended
+            st.rerun()
+    c_e1, c_e2 = st.columns(2)
+    with c_e1:
+        ed_res = st.text_area("Edit Resume", value=st.session_state.resume_raw, height=350, key="ed_res_box")
+    with c_e2:
+        default_job = st.session_state.get("last_job_text", "")
+        ed_job = st.text_area("Target Job Text", value=default_job, height=350, key="ed_job_box")
+    col_ed1, col_ed2 = st.columns([1, 1])
+    with col_ed1:
+        if st.button("🔄 Recalculate Delta", type="primary", use_container_width=True) and ed_res and ed_job:
+            c1, c2 = clean_text(ed_res), clean_text(ed_job)
+            s1, s2 = ext.extract(segment_skills(c1, ext)), ext.extract(segment_skills(c2, ext))
+            e1, e2 = embed_model.encode(c1), embed_model.encode(c2)
+            new_res = compute_match(c1, s1, e1, c2, s2, e2, kw_w)
+            orig_res = compute_match(st.session_state.resume_clean, st.session_state.resume_skills, st.session_state.resume_emb, c2, s2, e2, kw_w)
+            delta = int(new_res["final_score"]*100) - int(orig_res["final_score"]*100)
+            st.metric("New Score", f"{int(new_res['final_score']*100)}%", delta=f"{delta:+d}%")
+    with col_ed2:
+        st.download_button("📥 Download Revised Resume (.txt)", data=ed_res, file_name="tailored_resume.txt", mime="text/plain", use_container_width=True)

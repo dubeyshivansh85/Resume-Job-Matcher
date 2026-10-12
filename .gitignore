@@ -1,19 +1,21 @@
-data/postings.csv
-data/ds_postings_filtered.csv
-data/ds_postings_with_skills.csv
-data/ds_resumes_with_skills.csv
-data/posting_embeddings.npy
-data/resume_embeddings.npy
-Resume/
-
+# Python & Environment
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-
-.venv/
+*.pyo
+*.pyd
+.Python
+env/
 venv/
+.venv/
 .env
 
-.DS_Store
+# Jupyter & IDE
+.ipynb_checkpoints/
 .vscode/
 .idea/
+.DS_Store
+
+# Temporary & Build artifacts
+*.log
+.pytest_cache/
+.kilo/
